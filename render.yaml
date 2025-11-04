@@ -1,0 +1,23 @@
+services:
+  - type: web
+    name: ai-report-backend
+    env: python
+    region: oregon
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn server.webhook:app --host 0.0.0.0 --port $PORT
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.11.9
+      # Set these in Render's dashboard after first deploy (don’t put secrets here)
+      - key: APP_BASE_URL
+        value: https://ai.robalsolutions.com    # update later to your Streamlit domain
+      - key: CHECKOUT_SUCCESS_PATH
+        value: /Billing?success=1
+      - key: CHECKOUT_CANCEL_PATH
+        value: /Billing?canceled=1
+      - key: PORTAL_RETURN_PATH
+        value: /Billing?portal_return=1
+      # The following should be set in the Render UI, not committed:
+      # STRIPE_SECRET_KEY
+      # STRIPE_WEBHOOK_SECRET
