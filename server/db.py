@@ -1,9 +1,14 @@
-from sqlalchemy import create_engine
-from sqlalchemy.orm import sessionmaker, declarative_base
+
+# server/db.py
 import os
+from sqlalchemy import create_engine
 
-DATABASE_URL = os.getenv("DATABASE_URL")
+# Read from Render environment variable
+url = os.getenv("DATABASE_URL")
 
-engine = create_engine(DATABASE_URL)
-SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
-Base = declarative_base()
+# (Render may prefix it with postgres:// instead of postgresql://)
+if url.startswith("postgres://"):
+    url = url.replace("postgres://", "postgresql://", 1)
+
+# Create SQLAlchemy engine
+engine = create_engine(url, pool_pre_ping=True)
