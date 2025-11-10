@@ -28,6 +28,18 @@ stripe.api_key = STRIPE_SECRET_KEY
 
 app = FastAPI(title="AI Report SaaS Backend")
 
+from .db import engine
+
+@app.on_event("startup")
+def startup():
+    try:
+        with engine.connect() as conn:
+            conn.execute("SELECT 1")
+        print("✅ Database connection successful.")
+    except Exception as e:
+        print("❌ Database connection failed:", e)
+
+
 # Allow Streamlit front-end origins
 app.add_middleware(
     CORSMiddleware,
