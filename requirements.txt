@@ -4,9 +4,9 @@ stripe>=10.0
 requests>=2.31
 python-dotenv>=1.0
 
-# DB stack
+# --- DB ---
 SQLAlchemy>=2.0
-psycopg[binary]>=3.2
+psycopg[binary]>=3.1
 
 
 
