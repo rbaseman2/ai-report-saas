@@ -1,18 +1,18 @@
 # server/db.py
 import os
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, text
 
-url = os.environ.get("DATABASE_URL", "")
-if not url:
-    raise RuntimeError("DATABASE_URL not set")
-
-# Render may give postgres:// – normalize it
-if url.startswith("postgres://"):
-    url = url.replace("postgres://", "postgresql://", 1)
-
-# Tell SQLAlchemy to use psycopg v3
-if url.startswith("postgresql://"):
-    url = url.replace("postgresql://", "postgresql+psycopg://", 1)
+url = os.environ["DATABASE_URL"]
+url = url.replace("postgres://", "postgresql://", 1)
 
 engine = create_engine(url, pool_pre_ping=True)
+
+# 🔽 Add this block at the bottom
+if __name__ == "__main__":
+    try:
+        with engine.connect() as conn:
+            conn.execute(text("SELECT 1"))
+        print("✅ Database connection successful")
+    except Exception as e:
+        print("❌ Database connection failed:", e)
 
