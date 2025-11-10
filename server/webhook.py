@@ -1,4 +1,6 @@
 # server/webhook.py
+from sqlalchemy import text
+
 import os
 import stripe
 from fastapi import FastAPI, Request, HTTPException
