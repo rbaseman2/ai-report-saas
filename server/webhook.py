@@ -63,6 +63,10 @@ def health():
 def create_checkout_session(payload: CheckoutIn):
     try:
         customer = get_or_create_customer_by_email(payload.email)
+
+price_id = os.environ.get("PRICE_BASIC")
+print(">>> DEBUG creating checkout with price:", price_id, flush=True)
+
         session = stripe.checkout.Session.create(
             mode="subscription",
             customer=customer.id,
