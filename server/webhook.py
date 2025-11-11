@@ -70,7 +70,7 @@ def create_checkout_session(body: Body):
             cancel_url=CANCEL_URL,
             automatic_tax={"enabled": True},
             billing_address_collection="required",
-            customer_creation="always",
+          
         )
         return {"url": session.url}
 
