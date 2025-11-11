@@ -1,6 +1,15 @@
 # streamlit/pages/2_Billing.py
 import os, requests, streamlit as st
 
+# In streamlit/pages/2_Billing.py, near top of the page:
+status = st.query_params.get("status", [""])[0]
+if status == "success":
+    st.success("Payment successful—thanks! Your plan is active.")
+elif status == "cancelled":
+    st.info("Checkout cancelled.")
+
+
+
 def _get_backend_url() -> str:
     # Try secrets only if present; otherwise fall back to env var
     try:
