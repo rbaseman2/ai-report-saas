@@ -1,121 +1,169 @@
 # server/webhook.py
 import os
-import stripe
+import json
 from fastapi import FastAPI, Request, HTTPException
-from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
-from starlette.responses import JSONResponse
-from sqlalchemy import text  # ✅ needed for SQLAlchemy 2.x
-from .db import engine       # ✅ import your DB engine
+from fastapi.responses import JSONResponse
+from sqlalchemy import text
 
-# --- Load environment variables ---
-try:
-    from dotenv import load_dotenv
-    load_dotenv()
-except Exception:
-    pass
+import stripe
+from .db import engine, create_tables, ping
 
-# --- Environment variables ---
-STRIPE_SECRET_KEY     = os.environ["STRIPE_SECRET_KEY"]
-STRIPE_WEBHOOK_SECRET = os.environ["STRIPE_WEBHOOK_SECRET"]
-APP_BASE_URL          = os.environ.get("APP_BASE_URL", "http://localhost:8501")
-CHECKOUT_SUCCESS_PATH = os.environ.get("CHECKOUT_SUCCESS_PATH", "/Billing?success=1")
-CHECKOUT_CANCEL_PATH  = os.environ.get("CHECKOUT_CANCEL_PATH",  "/Billing?canceled=1")
-PORTAL_RETURN_PATH    = os.environ.get("PORTAL_RETURN_PATH",    "/Billing?portal_return=1")
+# --- Boot-time setup ---------------------------------------------------------
+stripe.api_key = os.environ["STRIPE_SECRET_KEY"]
+WEBHOOK_SECRET = os.environ["STRIPE_WEBHOOK_SECRET"]
 
-stripe.api_key = STRIPE_SECRET_KEY
+# Make sure tables exist and DB is reachable
+create_tables()
+ping()
 
-# --- FastAPI app setup ---
-app = FastAPI(title="AI Report SaaS Backend")
+app = FastAPI()
 
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=[APP_BASE_URL, "http://localhost:8501", "http://127.0.0.1:8501"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
-# ---------- STARTUP EVENT ----------
-@app.on_event("startup")
-def startup_event():
-    """Check DB connection on startup."""
-    try:
-        with engine.connect() as conn:
-            conn.execute(text("SELECT 1"))  # ✅ fixed for SQLAlchemy 2.x
-        print("✅ Database connection successful")
-    except Exception as e:
-        print("❌ Database connection failed:", e)
-
-# ---------- HEALTH CHECK ----------
 @app.get("/health")
 def health():
-    try:
-        with engine.connect() as conn:
-            conn.execute(text("SELECT 1"))
-        return {"ok": True}
-    except Exception as e:
-        return {"ok": False, "error": str(e)}
-
-# ---------- STRIPE WEBHOOK ----------
-@app.post("/webhook", tags=["Stripe"])
-async def webhook(req: Request):
-    payload = await req.body()
-    sig = req.headers.get("stripe-signature", "")
-    try:
-        event = stripe.Webhook.construct_event(
-            payload=payload, sig_header=sig, secret=STRIPE_WEBHOOK_SECRET
-        )
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=f"Webhook error: {e}")
-
-    if event["type"] == "checkout.session.completed":
-        session = event["data"]["object"]
-        print("✅ checkout.session.completed for", session.get("customer_details", {}).get("email"))
-        # You can add logic here to write to your entitlements table.
-
     return {"ok": True}
 
-# ---------- CHECKOUT ----------
-class CheckoutReq(BaseModel):
-    price_id: str
-    email: str
-
-@app.post("/create-checkout-session", tags=["Stripe"])
-def create_checkout_session(req: CheckoutReq):
-    try:
-        customers = stripe.Customer.list(email=req.email, limit=1)
-        customer = customers.data[0] if customers.data else stripe.Customer.create(email=req.email)
-
-        session = stripe.checkout.Session.create(
-            mode="subscription",
-            customer=customer.id,
-            line_items=[{"price": req.price_id, "quantity": 1}],
-            success_url=f"{APP_BASE_URL}{CHECKOUT_SUCCESS_PATH}",
-            cancel_url=f"{APP_BASE_URL}{CHECKOUT_CANCEL_PATH}",
-            allow_promotion_codes=True,
-            billing_address_collection="auto",
-            automatic_tax={"enabled": True},
+# Small helper to insert an event idempotently
+def _record_event(event_dict: dict) -> None:
+    with engine.begin() as conn:
+        conn.execute(
+            text("""
+                INSERT INTO stripe_events(event_id, type, payload)
+                VALUES (:event_id, :type, CAST(:payload AS JSONB))
+                ON CONFLICT (event_id) DO NOTHING
+            """),
+            {
+                "event_id": event_dict["id"],
+                "type": event_dict["type"],
+                "payload": json.dumps(event_dict),
+            },
         )
-        return JSONResponse({"url": session.url})
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=str(e))
 
-# ---------- CUSTOMER PORTAL ----------
-class PortalReq(BaseModel):
-    email: str
-
-@app.post("/create-portal-session", tags=["Stripe"])
-def create_portal_session(req: PortalReq):
-    try:
-        customers = stripe.Customer.list(email=req.email, limit=1)
-        if not customers.data:
-            raise HTTPException(status_code=404, detail="No Stripe customer for that email.")
-        customer = customers.data[0]
-        session = stripe.billing_portal.Session.create(
-            customer=customer.id,
-            return_url=f"{APP_BASE_URL}{PORTAL_RETURN_PATH}",
+# Upsert a subscription row
+def _upsert_subscription(*, customer_id: str, email: str | None,
+                         subscription_id: str, price_id: str | None,
+                         status: str | None, current_period_end: int | None) -> None:
+    with engine.begin() as conn:
+        conn.execute(
+            text("""
+                INSERT INTO subscriptions
+                  (customer_id, email, subscription_id, price_id, status, current_period_end)
+                VALUES
+                  (:customer_id, :email, :subscription_id, :price_id, :status,
+                   CASE WHEN :current_period_end IS NULL
+                        THEN NULL
+                        ELSE to_timestamp(:current_period_end) END)
+                ON CONFLICT (subscription_id) DO UPDATE
+                SET status = EXCLUDED.status,
+                    price_id = COALESCE(EXCLUDED.price_id, subscriptions.price_id),
+                    email = COALESCE(EXCLUDED.email, subscriptions.email),
+                    current_period_end = COALESCE(EXCLUDED.current_period_end, subscriptions.current_period_end)
+            """),
+            {
+                "customer_id": customer_id,
+                "email": email,
+                "subscription_id": subscription_id,
+                "price_id": price_id,
+                "status": status,
+                "current_period_end": current_period_end,
+            },
         )
-        return JSONResponse({"url": session.url})
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=str(e))
+
+@app.post("/webhook")
+async def stripe_webhook(request: Request):
+    raw = await request.body()
+    sig = request.headers.get("stripe-signature")
+
+    try:
+        event = stripe.Webhook.construct_event(
+            payload=raw, sig_header=sig, secret=WEBHOOK_SECRET
+        )
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+    # Store raw event (idempotent)
+    _record_event(event)
+
+    etype = event["type"]
+
+    # ---------------------------------------------------------------------------------
+    # 1) checkout.session.completed — user finished checkout, create/attach subscription
+    # ---------------------------------------------------------------------------------
+    if etype == "checkout.session.completed":
+        session = event["data"]["object"]
+
+        customer_id = session.get("customer")
+        email = session.get("customer_details", {}).get("email")
+        subscription_id = session.get("subscription")
+        price_id = session.get("metadata", {}).get("price_id")
+        status = None
+        current_period_end = None
+
+        # Fetch subscription to enrich details (status/period end/price)
+        if subscription_id:
+            sub = stripe.Subscription.retrieve(
+                subscription_id, expand=["items.data.price"]
+            )
+            status = sub.get("status")
+            current_period_end = sub.get("current_period_end")
+            if not price_id:
+                items = sub.get("items", {}).get("data", [])
+                if items:
+                    price_id = items[0].get("price", {}).get("id")
+
+        if customer_id and subscription_id:
+            _upsert_subscription(
+                customer_id=customer_id,
+                email=email,
+                subscription_id=subscription_id,
+                price_id=price_id,
+                status=status,
+                current_period_end=current_period_end,
+            )
+
+    # ---------------------------------------------------------------------------------
+    # 2) Subscription lifecycle events — keep status/dates up to date
+    # ---------------------------------------------------------------------------------
+    elif etype in ("customer.subscription.created",
+                   "customer.subscription.updated",
+                   "customer.subscription.deleted"):
+        sub = event["data"]["object"]
+        customer_id = sub.get("customer")
+        subscription_id = sub.get("id")
+        status = sub.get("status")
+        current_period_end = sub.get("current_period_end")
+        items = sub.get("items", {}).get("data", [])
+        price_id = items[0].get("price", {}).get("id") if items else None
+
+        # Email isn’t on subscription; we’ll leave None here.
+        if customer_id and subscription_id:
+            _upsert_subscription(
+                customer_id=customer_id,
+                email=None,
+                subscription_id=subscription_id,
+                price_id=price_id,
+                status=status,
+                current_period_end=current_period_end,
+            )
+
+    return JSONResponse({"received": True})
+
+
+# Optional: quick helper endpoint to check a user's plan/status by email
+@app.get("/entitlement/{email}")
+def entitlement(email: str):
+    row = None
+    with engine.begin() as conn:
+        row = conn.execute(
+            text("""
+                SELECT price_id, status
+                FROM subscriptions
+                WHERE email = :email
+                ORDER BY id DESC
+                LIMIT 1
+            """),
+            {"email": email},
+        ).mappings().first()
+
+    if not row:
+        return {"email": email, "plan": None, "status": "none"}
+    return {"email": email, "plan": row["price_id"], "status": row["status"]}
