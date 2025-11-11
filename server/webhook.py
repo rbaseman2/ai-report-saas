@@ -1,96 +1,36 @@
-# server/webhook.py
-import os
-from typing import Optional
+import os, stripe
+from fastapi import HTTPException
+from stripe.error import StripeError, InvalidRequestError
 
-import stripe
-from fastapi import FastAPI, HTTPException
-from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, EmailStr
-from sqlalchemy import text
+PLAN_TO_PRICE = {
+    "basic": os.environ["PRICE_BASIC"],
+    "pro": os.environ["PRICE_PRO"],
+    "enterprise": os.environ["PRICE_ENTERPRISE"],
+}
 
-from .db import engine  # uses DATABASE_URL and creates the SQLAlchemy engine
+@router.post("/create-checkout-session")
+def create_checkout_session(body: Body):
+    # 1) Resolve plan -> price id
+    price_id = PLAN_TO_PRICE.get(body.plan)
+    if not price_id:
+        raise HTTPException(400, "Unknown plan")
 
-# --- Stripe setup ---
-STRIPE_SECRET_KEY = os.getenv("STRIPE_SECRET_KEY")
-if not STRIPE_SECRET_KEY:
-    raise RuntimeError("Missing STRIPE_SECRET_KEY env")
-stripe.api_key = STRIPE_SECRET_KEY
+    # 2) DEBUG LOG (outside/above the try is fine)
+    print(f">>> DEBUG plan={body.plan}, price_id={price_id}", flush=True)
 
-# Where to send users after checkout / portal
-# For local Streamlit testing this is fine; you can override in Render env later.
-FRONTEND_BASE = os.getenv("FRONTEND_BASE", "http://localhost:8501")
-SUCCESS_URL = os.getenv("SUCCESS_URL", f"{FRONTEND_BASE}/Billing?success=1")
-CANCEL_URL  = os.getenv("CANCEL_URL",  f"{FRONTEND_BASE}/Billing?canceled=1")
-PORTAL_RETURN_URL = os.getenv("PORTAL_RETURN_URL", f"{FRONTEND_BASE}/Billing")
-
-app = FastAPI(title="AI Report SaaS Backend")
-
-# CORS (so the Streamlit frontend can call us)
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],  # tighten later
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
-# ---------- Models ----------
-class CheckoutIn(BaseModel):
-    price_id: str
-    email: EmailStr
-
-class PortalIn(BaseModel):
-    email: EmailStr
-
-# ---------- Utilities ----------
-def get_or_create_customer_by_email(email: str) -> stripe.Customer:
-    """Return existing Stripe customer by email or create one."""
-    # Try to reuse an existing customer
-    res = stripe.Customer.list(email=email, limit=1)
-    if res.data:
-        return res.data[0]
-    return stripe.Customer.create(email=email)
-
-# ---------- Routes ----------
-@app.get("/health")
-def health():
-    # DB ping; if DB is down this will raise and Render will show a 500
-    with engine.connect() as conn:
-        conn.execute(text("SELECT 1"))
-    return {"ok": True}
-
-@app.post("/create-checkout-session")
-def create_checkout_session(payload: CheckoutIn):
     try:
-        customer = get_or_create_customer_by_email(payload.email)
-
-price_id = os.environ.get("PRICE_BASIC")
-print(">>> DEBUG creating checkout with price:", price_id, flush=True)
-
         session = stripe.checkout.Session.create(
             mode="subscription",
-            customer=customer.id,
-            line_items=[{"price": payload.price_id, "quantity": 1}],
-            success_url=SUCCESS_URL,
-            cancel_url=CANCEL_URL,
+            line_items=[{"price": price_id, "quantity": 1}],
+            success_url=os.environ["SUCCESS_URL"] + "?session_id={CHECKOUT_SESSION_ID}",
+            cancel_url=os.environ["CANCEL_URL"],
+            automatic_tax={"enabled": True},
         )
         return {"url": session.url}
-    except stripe.error.StripeError as e:
-        # Bubble up Stripe message to the client
-        raise HTTPException(status_code=400, detail=str(e)) from e
-    except Exception as e:
-        raise HTTPException(status_code=500, detail="Failed to create checkout") from e
 
-@app.post("/create-portal-session")
-def create_portal_session(payload: PortalIn):
-    try:
-        customer = get_or_create_customer_by_email(payload.email)
-        ps = stripe.billing_portal.Session.create(
-            customer=customer.id,
-            return_url=PORTAL_RETURN_URL,
-        )
-        return {"url": ps.url}
-    except stripe.error.StripeError as e:
-        raise HTTPException(status_code=400, detail=str(e)) from e
-    except Exception as e:
-        raise HTTPException(status_code=500, detail="Failed to create portal session") from e
+    except InvalidRequestError as e:
+        raise HTTPException(400, e.user_message or str(e))
+    except StripeError:
+        raise HTTPException(400, "Payment provider error")
+    except Exception:
+        raise HTTPException(500, "Checkout creation failed")
