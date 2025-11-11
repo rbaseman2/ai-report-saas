@@ -37,12 +37,16 @@ def create_checkout_session(body: Body):
 
     try:
         session = stripe.checkout.Session.create(
-            mode="subscription",
-            line_items=[{"price": price_id, "quantity": 1}],
-            success_url=os.environ["SUCCESS_URL"] + "?session_id={CHECKOUT_SESSION_ID}",
-            cancel_url=os.environ["CANCEL_URL"],
-            automatic_tax={"enabled": True},
-        )
+    mode="subscription",
+    line_items=[{"price": price_id, "quantity": 1}],
+    allow_promotion_codes=True,            # 👈 shows “Add promotion code” box
+    success_url=SUCCESS_URL + "?session_id={CHECKOUT_SESSION_ID}",
+    cancel_url=CANCEL_URL,
+    automatic_tax={"enabled": True},
+    billing_address_collection="required", # optional but helpful for tax
+    customer_creation="always",            # optional (creates/links a Customer)
+)
+
         return {"url": session.url}
 
     except InvalidRequestError as e:
