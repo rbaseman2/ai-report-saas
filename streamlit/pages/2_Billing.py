@@ -1,14 +1,12 @@
+# streamlit/pages/2_Billing.py
 import os
 import requests
 import streamlit as st
 
-# --- read backend URL without triggering secrets banner ---
 def _get_backend_url() -> str:
-    # 1) env var on Render (recommended)
     url = os.getenv("BACKEND_URL", "").rstrip("/")
     if url:
         return url
-    # 2) optional Streamlit secrets (only used if you create a secrets.toml)
     try:
         return st.secrets.get("backend_url", "").rstrip("/")
     except Exception:
@@ -16,13 +14,16 @@ def _get_backend_url() -> str:
 
 BACKEND_URL = _get_backend_url()
 
-# show post-checkout status, if any
-status = st.query_params.get("status", [""])[0]
-if status == "success":
-    st.success("Payment successful—thanks! Your plan is active.")
-elif status == "cancelled":
-    st.info("Checkout cancelled.")
+# ---- Robust query param parsing --------------------------------------------
+qp = st.query_params
+status_raw = qp.get("status", [""])[0]  # may contain junk if URL had '?status=success?session_id=...'
+session_id = qp.get("session_id", [""])[0]
 
+# tolerate accidental second '?'
+# e.g. 'success?session_id=cs_123' -> 'success'
+status = status_raw.split("?")[0].split("&")[0].lower()
+
+# ---------------------------------------------------------------------------
 st.header("Plans")
 
 def start_checkout(plan: str):
@@ -32,7 +33,7 @@ def start_checkout(plan: str):
     try:
         r = requests.post(
             f"{BACKEND_URL}/create-checkout-session",
-            json={"plan": plan},  # server resolves plan -> price
+            json={"plan": plan},
             timeout=20,
         )
     except requests.RequestException as e:
@@ -44,11 +45,7 @@ def start_checkout(plan: str):
         if not url:
             st.error("Backend did not return a checkout URL.")
             return
-        # redirect
-        st.markdown(
-            f'<meta http-equiv="refresh" content="0; url={url}">',
-            unsafe_allow_html=True,
-        )
+        st.markdown(f'<meta http-equiv="refresh" content="0; url={url}">', unsafe_allow_html=True)
         st.write(f"[Open Stripe Checkout]({url})")
     else:
         try:
@@ -68,6 +65,38 @@ with col3:
     if st.button("Choose Enterprise"):
         start_checkout("enterprise")
 
-# tiny debug footer (safe to keep or remove)
+# --- Post-checkout UX -------------------------------------------------------
+if status == "success" or session_id:
+    st.success("Payment successful—thanks! Your plan is active.")
+    st.caption("You can manage your subscription below.")
+
+    if st.button("Manage subscription"):
+        try:
+            r = requests.post(
+                f"{BACKEND_URL}/create-portal-session",
+                json={"session_id": session_id},
+                timeout=20,
+            )
+        except requests.RequestException as e:
+            st.error(f"Network error: {e}")
+        else:
+            if r.status_code == 200:
+                portal_url = (r.json() or {}).get("url")
+                if portal_url:
+                    st.markdown(
+                        f'<meta http-equiv="refresh" content="0; url={portal_url}">',
+                        unsafe_allow_html=True,
+                    )
+                    st.write(f"[Open Subscription Portal]({portal_url})")
+                else:
+                    st.error("Portal URL not returned by backend.")
+            else:
+                try:
+                    msg = r.json().get("detail")
+                except Exception:
+                    msg = r.text
+                st.error(f"Could not open portal ({r.status_code}): {msg}")
+
+# small debug footer
 if BACKEND_URL:
     st.caption(f"Using backend: {BACKEND_URL}")
