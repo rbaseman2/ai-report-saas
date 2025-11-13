@@ -3,8 +3,7 @@ import os
 import re
 from typing import List, Optional
 
-import psycopg2
-import psycopg2.extras
+
 import stripe
 from fastapi import APIRouter, FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
