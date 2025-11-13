@@ -28,13 +28,18 @@ st.caption(
 # Backend URL helper (same pattern as Billing page)
 # ---------------------------------------------------------------------
 def _get_backend_url() -> str:
+    """
+    Prefer BACKEND_URL env var (Render) and only fall back to
+    st.secrets when running locally. Prevents red 'No secrets' banner on Render.
+    """
+    env_val = os.getenv("BACKEND_URL", "").rstrip("/")
+    if env_val:
+        return env_val
+
     try:
-        # If you’ve set [backend_url] in .streamlit/secrets.toml (local dev)
         return st.secrets["backend_url"].rstrip("/")
     except Exception:
-        return os.getenv("BACKEND_URL", "").rstrip("/")
-
-
+        return ""
 BACKEND_URL = _get_backend_url()
 
 # ---------------------------------------------------------------------
