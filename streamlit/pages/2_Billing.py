@@ -10,12 +10,20 @@ import streamlit as st
 
 
 def _get_backend_url() -> str:
-    # Prefer Streamlit secret if present; fall back to env var
+    """
+    Prefer BACKEND_URL env var (Render style), and only fall back to
+    st.secrets["backend_url"] when running locally and there is no env var.
+    This avoids the 'No secrets found' warning on Render.
+    """
+    env_val = os.getenv("BACKEND_URL", "").rstrip("/")
+    if env_val:
+        return env_val
+
+    # Optional: local dev using .streamlit/secrets.toml
     try:
         return st.secrets["backend_url"].rstrip("/")
     except Exception:
-        return os.getenv("BACKEND_URL", "").rstrip("/")
-
+        return ""
 
 BACKEND_URL = _get_backend_url()
 
