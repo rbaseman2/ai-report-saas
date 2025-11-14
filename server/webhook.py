@@ -13,6 +13,10 @@ import stripe
 from fastapi import FastAPI, APIRouter, HTTPException, Request, Query
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
+from pydantic import BaseModel
+from openai import OpenAI
+
+
 
 # ------------------------------------------------------------------------------
 # Optional Postgres via pg8000 (pure-Python, works on Python 3.13+)
@@ -229,6 +233,65 @@ async def stripe_webhook(request: Request):
                 print(f">>> WARNING: failed to record subscription: {e}", flush=True)
 
     return {"received": True}
+
+# ---------- AI summarization ----------
+
+client = OpenAI()  # uses OPENAI_API_KEY from environment
+
+
+class SummarizeRequest(BaseModel):
+    text: str
+
+
+class SummarizeResponse(BaseModel):
+    summary: str
+    input_chars: int
+    model: str
+
+
+@router.post("/summarize", response_model=SummarizeResponse)
+async def summarize(req: SummarizeRequest):
+    """
+    Take raw text from the Streamlit app and return a patient-friendly summary.
+    """
+    text = (req.text or "").strip()
+    if not text:
+        raise HTTPException(status_code=400, detail="No text provided for summarization.")
+
+    # Simple safety/size guard – trim if someone uploads a novel 🙂
+    max_chars = 16_000
+    if len(text) > max_chars:
+        text = text[:max_chars]
+
+    try:
+        resp = client.chat.completions.create(
+            model="gpt-4o-mini",
+            temperature=0.3,
+            messages=[
+                {
+                    "role": "system",
+                    "content": (
+                        "You are a clinical assistant that rewrites long, technical consultation notes "
+                        "into a short, clear summary for patients. Use plain language at about an 8th "
+                        "grade reading level. Keep it factual and avoid adding new information."
+                    ),
+                },
+                {
+                    "role": "user",
+                    "content": text,
+                },
+            ],
+        )
+    except Exception as e:
+        # Surface a clean error back to Streamlit
+        raise HTTPException(status_code=500, detail=f"OpenAI error: {e}") from e
+
+    summary = resp.choices[0].message.content.strip()
+    return SummarizeResponse(
+        summary=summary,
+        input_chars=len(text),
+        model=resp.model,
+    )
 
 
 def _stripe_lookup(email: str) -> Dict[str, Any]:

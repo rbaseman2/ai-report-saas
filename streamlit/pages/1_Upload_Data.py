@@ -176,10 +176,12 @@ def _summarize_via_backend(text: str, max_sentences: int = 6):
             "text": text,
             "max_sentences": max_sentences,
         }
-        r = requests.post(
-            f"{BACKEND_URL}/summarize",
-            json=payload,
-            timeout=30,
+       response = requests.post(
+    f"{BACKEND_URL}/summarize",
+    json={"text": cleaned_text},
+    timeout=60,
+)
+
         )
         if r.status_code != 200:
             st.error(
