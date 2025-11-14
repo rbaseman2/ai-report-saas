@@ -3,18 +3,11 @@ uvicorn[standard]>=0.30
 stripe>=10.0
 requests>=2.31
 python-dotenv>=1.0
+openai>=1.0.0 
 
 
 # --- DB ---
-fastapi>=0.115
-uvicorn[standard]>=0.30
-stripe>=10.0
-requests>=2.31
-python-dotenv>=1.0
-
-# --- DB (optional, pure-Python Postgres driver) ---
-pg8000>=1.31.2
-
-
-
-
+SQLAlchemy>=2.0
+email-validator
+pydantic
+psycopg2-binary==2.9.9
