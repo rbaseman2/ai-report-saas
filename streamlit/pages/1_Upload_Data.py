@@ -12,11 +12,13 @@ st.set_page_config(page_title="Upload Data", page_icon="📄", layout="wide")
 
 
 def _get_backend_url() -> str:
-    """Get the backend URL from secrets or env vars."""
-    try:
-        return st.secrets["backend_url"].rstrip("/")
-    except Exception:
-        return os.getenv("BACKEND_URL", "").rstrip("/")
+    """
+    Get the backend URL from environment variables only.
+
+    Using st.secrets without a secrets.toml on Render causes that
+    "No secrets found" warning banner, so we avoid it here.
+    """
+    return os.getenv("BACKEND_URL", "").rstrip("/")
 
 
 BACKEND_URL = _get_backend_url()
