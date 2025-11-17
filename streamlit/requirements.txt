@@ -3,7 +3,9 @@ requests==2.32.3
 python-dotenv>=1.0
 
 pandas
+pypdf>=4.0
 PyPDF2
 python-docx
+
 
 
