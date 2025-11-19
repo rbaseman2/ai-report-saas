@@ -1,382 +1,259 @@
-"""
-FastAPI backend for Stripe billing + entitlements.
-
-- Creates Checkout Sessions for Basic / Pro / Enterprise plans
-- Exposes a small "me" endpoint for the Streamlit app to check subscription status
-- (Optionally) logs subscriptions into Postgres via pg8000 if DATABASE_URL is set
-"""
-
 import os
-from typing import Optional, Dict, Any
+import sqlite3
+from typing import Optional
 
-import stripe
-from fastapi import FastAPI, APIRouter, HTTPException, Request, Query
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-from pydantic import BaseModel
+import stripe
 from openai import OpenAI
 
+# ------------- ENV / CONFIG ------------ #
 
+stripe.api_key = os.getenv("STRIPE_SECRET_KEY")
+WEBHOOK_SECRET = os.getenv("STRIPE_WEBHOOK_SECRET", "")
 
-# ------------------------------------------------------------------------------
-# Optional Postgres via pg8000 (pure-Python, works on Python 3.13+)
-# ------------------------------------------------------------------------------
+PRICE_BASIC = os.getenv("PRICE_BASIC")
+PRICE_PRO = os.getenv("PRICE_PRO")
+PRICE_ENTERPRISE = os.getenv("PRICE_ENTERPRISE")
 
-try:
-    import pg8000.native as pg
-except Exception:  # DB is optional – if pg8000 isn't installed we just skip it
-    pg = None
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 
-DATABASE_URL = os.getenv("DATABASE_URL")
+client = OpenAI(api_key=OPENAI_API_KEY)
 
+DB_PATH = os.getenv("SUBSCRIPTION_DB_PATH", "subscriptions.db")
 
-def _parse_database_url(url: str) -> Dict[str, Any]:
-    # Expected format: postgres://user:pass@host:port/dbname
-    import urllib.parse as up
-
-    if not url:
-        raise RuntimeError("DATABASE_URL is empty")
-
-    up.uses_netloc.append("postgres")
-    parsed = up.urlparse(url)
-
-    return dict(
-        user=parsed.username,
-        password=parsed.password,
-        host=parsed.hostname,
-        port=parsed.port or 5432,
-        database=parsed.path.lstrip("/"),
-    )
-
-
-def _get_conn():
-    if not (pg and DATABASE_URL):
-        return None
-    cfg = _parse_database_url(DATABASE_URL)
-    return pg.Connection(**cfg)
-
-
-def ensure_schema() -> None:
-    """
-    Create a tiny table to remember user subscriptions.
-    If there's no DATABASE_URL or no pg8000, this is a no-op.
-    """
-    conn = _get_conn()
-    if not conn:
-        print(">>> INFO: Subscription DB disabled (no DATABASE_URL or pg8000).", flush=True)
-        return
-
-    conn.run(
-        """
-        CREATE TABLE IF NOT EXISTS user_subscriptions (
-            id                 BIGSERIAL PRIMARY KEY,
-            email              TEXT NOT NULL,
-            stripe_customer_id TEXT,
-            plan               TEXT,
-            active             BOOLEAN NOT NULL DEFAULT TRUE,
-            last_checkout_at   TIMESTAMPTZ NOT NULL DEFAULT NOW()
-        );
-        """
-    )
-    print(">>> DEBUG: user_subscriptions table ready.", flush=True)
-
-
-def record_subscription(email: str, customer_id: str, plan: str, active: bool) -> None:
-    """
-    Store one row per checkout. For now we just INSERT and when we read
-    we take the latest row for that email.
-    """
-    conn = _get_conn()
-    if not conn:
-        return
-
-    conn.run(
-        """
-        INSERT INTO user_subscriptions (email, stripe_customer_id, plan, active)
-        VALUES (:email, :cid, :plan, :active);
-        """,
-        email=email,
-        cid=customer_id,
-        plan=plan,
-        active=active,
-    )
-
-
-def get_latest_subscription(email: str) -> Optional[Dict[str, Any]]:
-    """
-    Return the latest subscription row for this email, or None.
-    """
-    conn = _get_conn()
-    if not conn:
-        return None
-
-    rows = conn.run(
-        """
-        SELECT email, stripe_customer_id, plan, active, last_checkout_at
-        FROM user_subscriptions
-        WHERE lower(email) = lower(:email)
-        ORDER BY last_checkout_at DESC
-        LIMIT 1;
-        """,
-        email=email,
-    )
-
-    if not rows:
-        return None
-
-    rec = rows[0]
-    return {
-        "email": rec[0],
-        "stripe_customer_id": rec[1],
-        "plan": rec[2],
-        "active": bool(rec[3]),
-        "last_checkout_at": rec[4],
-    }
-
-
-# ------------------------------------------------------------------------------
-# Stripe configuration
-# ------------------------------------------------------------------------------
-
-stripe.api_key = os.environ["STRIPE_SECRET_KEY"]
-
-PLAN_TO_PRICE = {
-    "basic": os.environ.get("PRICE_BASIC"),
-    "pro": os.environ.get("PRICE_PRO"),
-    "enterprise": os.environ.get("PRICE_ENTERPRISE"),
+PLAN_BY_PRICE = {
+    PRICE_BASIC: "basic",
+    PRICE_PRO: "pro",
+    PRICE_ENTERPRISE: "enterprise",
 }
 
-FRONTEND_URL = os.getenv("FRONTEND_URL", "").rstrip("/")
-SUCCESS_URL = os.getenv("SUCCESS_URL") or (FRONTEND_URL + "/Billing")
-CANCEL_URL = os.getenv("CANCEL_URL") or (FRONTEND_URL + "/Billing")
-
-WEBHOOK_SECRET = os.getenv("STRIPE_WEBHOOK_SECRET")
-
-router = APIRouter()
+# ------------- DB SETUP ------------ #
 
 
-class CheckoutBody(BaseModel):
-    plan: str  # "basic" | "pro" | "enterprise"
-
-
-# ------------------------------------------------------------------------------
-# Routes
-# ------------------------------------------------------------------------------
-
-@router.post("/create-checkout-session")
-def create_checkout_session(body: CheckoutBody):
-    price_id = PLAN_TO_PRICE.get(body.plan)
-    if not price_id:
-        raise HTTPException(status_code=400, detail=f"Unknown plan: {body.plan}")
-
-    try:
-        session = stripe.checkout.Session.create(
-            mode="subscription",
-            line_items=[{"price": price_id, "quantity": 1}],
-            allow_promotion_codes=True,
-            success_url=SUCCESS_URL + "?session_id={CHECKOUT_SESSION_ID}&status=success",
-            cancel_url=CANCEL_URL + "?status=cancelled",
-            automatic_tax={"enabled": True},
-            billing_address_collection="required",
+def init_db():
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS subscriptions (
+            email TEXT PRIMARY KEY,
+            plan TEXT NOT NULL,
+            status TEXT NOT NULL
         )
-        return {"url": session.url}
-    except stripe.error.StripeError as e:
-        msg = getattr(e, "user_message", str(e))
-        raise HTTPException(status_code=400, detail=msg)
-    except Exception as e:  # pragma: no cover
-        print(f">>> UNEXPECTED ERROR creating checkout session: {e}", flush=True)
-        raise HTTPException(status_code=500, detail="Checkout creation failed")
-
-
-@router.post("/webhook")
-async def stripe_webhook(request: Request):
-    # If no webhook secret is configured, abort early
-    if not WEBHOOK_SECRET:
-        raise HTTPException(status_code=500, detail="Webhook endpoint not configured")
-
-    payload = await request.body()
-    sig_header = request.headers.get("stripe-signature")
-
-    try:
-        event = stripe.Webhook.construct_event(
-            payload=payload, sig_header=sig_header, secret=WEBHOOK_SECRET
-        )
-    except ValueError:
-        raise HTTPException(status_code=400, detail="Invalid payload")
-    except stripe.error.SignatureVerificationError:
-        raise HTTPException(status_code=400, detail="Invalid signature")
-
-    if event["type"] == "checkout.session.completed":
-        session = event["data"]["object"]
-        customer_id = session.get("customer")
-        email = (session.get("customer_details") or {}).get("email")
-        plan = None
-
-        # Try to infer plan from the first line item
-        try:
-            line_items = stripe.checkout.Session.list_line_items(session["id"], limit=1)
-            if line_items["data"]:
-                price = line_items["data"][0]["price"]
-                plan = price.get("nickname") or price.get("id")
-        except Exception:
-            pass
-
-        if email and customer_id:
-            try:
-                record_subscription(
-                    email=email,
-                    customer_id=customer_id,
-                    plan=plan or "unknown",
-                    active=True,
-                )
-            except Exception as e:  # pragma: no cover
-                print(f">>> WARNING: failed to record subscription: {e}", flush=True)
-
-    return {"received": True}
-
-# ---------- AI summarization ----------
-
-client = OpenAI()  # uses OPENAI_API_KEY from environment
-
-
-class SummarizeRequest(BaseModel):
-    text: str
-
-
-class SummarizeResponse(BaseModel):
-    summary: str
-    input_chars: int
-    model: str
-
-
-@router.post("/summarize", response_model=SummarizeResponse)
-async def summarize(req: SummarizeRequest):
-    """
-    Take raw text from the Streamlit app and return a patient-friendly summary.
-    """
-    text = (req.text or "").strip()
-    if not text:
-        raise HTTPException(status_code=400, detail="No text provided for summarization.")
-
-    # Simple safety/size guard – trim if someone uploads a novel 🙂
-    max_chars = 16_000
-    if len(text) > max_chars:
-        text = text[:max_chars]
-
-    try:
-        resp = client.chat.completions.create(
-            model="gpt-4o-mini",
-            temperature=0.3,
-            messages=[
-                {
-                    "role": "system",
-                    "content": (
-                        "You are a clinical assistant that rewrites long, technical consultation notes "
-                        "into a short, clear summary for patients. Use plain language at about an 8th "
-                        "grade reading level. Keep it factual and avoid adding new information."
-                    ),
-                },
-                {
-                    "role": "user",
-                    "content": text,
-                },
-            ],
-        )
-    except Exception as e:
-        # Surface a clean error back to Streamlit
-        raise HTTPException(status_code=500, detail=f"OpenAI error: {e}") from e
-
-    summary = resp.choices[0].message.content.strip()
-    return SummarizeResponse(
-        summary=summary,
-        input_chars=len(text),
-        model=resp.model,
+        """
     )
+    conn.commit()
+    conn.close()
 
 
-def _stripe_lookup(email: str) -> Dict[str, Any]:
-    """
-    Fallback lookup directly against Stripe in case the DB is empty/disabled.
-    """
-    customers = stripe.Customer.list(email=email, limit=1).data
-    if not customers:
-        return {"has_active_subscription": False, "plan": None}
-
-    cust = customers[0]
-    subs = stripe.Subscription.list(customer=cust.id, status="active", limit=1).data
-    if not subs:
-        return {"has_active_subscription": False, "plan": None}
-
-    sub = subs[0]
-    price = sub["items"]["data"][0]["price"]
-    plan = price.get("nickname") or price.get("id")
-    return {"has_active_subscription": True, "plan": plan}
+def upsert_subscription(email: str, plan: str, status: str):
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    cur.execute(
+        """
+        INSERT INTO subscriptions(email, plan, status)
+        VALUES (?, ?, ?)
+        ON CONFLICT(email) DO UPDATE SET
+            plan=excluded.plan,
+            status=excluded.status
+        """,
+        (email, plan, status),
+    )
+    conn.commit()
+    conn.close()
 
 
-@router.get("/me")
-def me(email: str = Query(..., description="User email to check entitlements for")):
-    """
-    Small helper endpoint used by the Streamlit app.
-
-    Returns:
-        {
-          "email": "...",
-          "has_active_subscription": bool,
-          "plan": str | None
-        }
-    """
-    email = email.strip().lower()
-    if not email:
-        raise HTTPException(status_code=400, detail="Email is required")
-
-    # 1) Try DB
-    sub = None
-    try:
-        sub = get_latest_subscription(email)
-    except Exception as e:  # pragma: no cover
-        print(f">>> WARNING: DB lookup failed, falling back to Stripe: {e}", flush=True)
-
-    if sub:
-        return {
-            "email": email,
-            "has_active_subscription": bool(sub["active"]),
-            "plan": sub["plan"],
-        }
-
-    # 2) Fallback to Stripe
-    res = _stripe_lookup(email)
-    return {
-        "email": email,
-        **res,
-    }
+def get_subscription(email: str) -> Optional[dict]:
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    cur.execute("SELECT email, plan, status FROM subscriptions WHERE email = ?", (email,))
+    row = cur.fetchone()
+    conn.close()
+    if not row:
+        return None
+    return {"email": row[0], "plan": row[1], "status": row[2]}
 
 
-@router.get("/health")
-def health():
-    return {"ok": True}
+init_db()
 
+# ------------- FASTAPI APP ------------ #
 
-# ------------------------------------------------------------------------------
-# FastAPI app wiring
-# ------------------------------------------------------------------------------
-
-app = FastAPI()
+app = FastAPI(title="AI Report Backend")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # You can restrict this to your Streamlit domain
+    allow_origins=["*"],  # tighten later if you want
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-app.include_router(router)
+
+# ------------- MODELS ------------ #
+
+class CheckoutRequest(BaseModel):
+    email: str
+    plan: str  # 'basic' | 'pro' | 'enterprise'
 
 
-@app.on_event("startup")
-def _startup():
-    print(">>> DEBUG using webhook file: server/webhook.py", flush=True)
+class SummarizeRequest(BaseModel):
+    email: str
+    text: str
+
+
+# ------------- ROUTES ------------ #
+
+@app.get("/health")
+def health():
+    return {"ok": True}
+
+
+@app.get("/subscription-status")
+def subscription_status(email: str):
+    """
+    Return subscription info for a given email.
+    If none found, treat as free.
+    """
+    sub = get_subscription(email)
+    if not sub:
+        return {"email": email, "plan": "free", "active": False}
+
+    active = sub["status"] == "active"
+    return {"email": email, "plan": sub["plan"], "active": active}
+
+
+@app.post("/create-checkout-session")
+def create_checkout_session(payload: CheckoutRequest):
+    if not stripe.api_key:
+        raise HTTPException(status_code=500, detail="Stripe is not configured.")
+
+    plan = payload.plan.lower()
+    price_id = None
+
+    if plan == "basic":
+        price_id = PRICE_BASIC
+    elif plan == "pro":
+        price_id = PRICE_PRO
+    elif plan == "enterprise":
+        price_id = PRICE_ENTERPRISE
+
+    if not price_id:
+        raise HTTPException(status_code=400, detail="Invalid plan selected.")
+
     try:
-        ensure_schema()
-    except Exception as e:  # pragma: no cover
-        print(f">>> WARNING: ensure_schema failed: {e}", flush=True)
+        session = stripe.checkout.Session.create(
+            mode="subscription",
+            payment_method_types=["card"],
+            line_items=[
+                {
+                    "price": price_id,
+                    "quantity": 1,
+                }
+            ],
+            customer_email=payload.email,
+            success_url=os.getenv("SUCCESS_URL", "") + "?status=success",
+            cancel_url=os.getenv("CANCEL_URL", "") + "?status=cancel",
+        )
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+
+    return {"checkout_url": session.url}
+
+
+@app.post("/webhook")
+async def stripe_webhook(request: Request):
+    """
+    Stripe webhook to mark subscriptions as active/cancelled.
+    """
+    if not WEBHOOK_SECRET:
+        # If you haven't configured the secret, ignore verification
+        payload = await request.body()
+        event = stripe.Event.construct_from(request.json(), stripe.api_key)
+    else:
+        payload = await request.body()
+        sig_header = request.headers.get("stripe-signature", "")
+        try:
+            event = stripe.Webhook.construct_event(
+                payload=payload, sig_header=sig_header, secret=WEBHOOK_SECRET
+            )
+        except Exception as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
+
+    event_type = event["type"]
+    data = event["data"]["object"]
+
+    email = data.get("customer_email") or data.get("customer_details", {}).get("email")
+    status = None
+    plan = None
+
+    if event_type == "checkout.session.completed":
+        # Subscription will be created; treat as active once checkout completes.
+        price_id = None
+        if data.get("subscription"):
+            sub = stripe.Subscription.retrieve(data["subscription"])
+            if sub["items"]["data"]:
+                price_id = sub["items"]["data"][0]["price"]["id"]
+        elif data.get("line_items"):
+            # Optional fallback
+            pass
+
+        plan = PLAN_BY_PRICE.get(price_id, "basic")
+        status = "active"
+
+    elif event_type in ("customer.subscription.deleted", "customer.subscription.canceled"):
+        # Mark as inactive
+        price_id = data["items"]["data"][0]["price"]["id"]
+        plan = PLAN_BY_PRICE.get(price_id, "basic")
+        status = "canceled"
+
+    if email and plan and status:
+        upsert_subscription(email=email, plan=plan, status=status)
+
+    return {"received": True}
+
+
+# ------------- SUMMARIZATION ------------ #
+
+SYSTEM_PROMPT = """
+You are an expert business communicator.
+
+A user will send you long, sometimes messy text: reports, emails, meeting notes,
+technical documentation, or research.
+
+Your job is to:
+- Extract the key points and explain them in clear, simple language.
+- Focus on what a non-technical client, manager, or business stakeholder needs to know.
+- Highlight important decisions, risks, and next steps.
+- Avoid medical or clinical framing. This is general business content.
+
+Write the summary in short paragraphs and bullet points, using a neutral, professional tone.
+Do not invent facts that are not supported by the input.
+"""
+
+
+@app.post("/summarize")
+def summarize(payload: SummarizeRequest):
+    if not OPENAI_API_KEY:
+        raise HTTPException(status_code=500, detail="OpenAI API key is not configured.")
+
+    text = payload.text.strip()
+    if not text:
+        raise HTTPException(status_code=400, detail="No text provided for summarization.")
+
+    try:
+        completion = client.chat.completions.create(
+            model=os.getenv("OPENAI_MODEL", "gpt-4.1-mini"),
+            messages=[
+                {"role": "system", "content": SYSTEM_PROMPT},
+                {"role": "user", "content": text},
+            ],
+            temperature=0.2,
+        )
+        summary = completion.choices[0].message.content.strip()
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+
+    return {"summary": summary}
+
