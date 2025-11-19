@@ -143,19 +143,16 @@ def create_checkout_session(payload: CheckoutRequest):
         raise HTTPException(status_code=400, detail="Invalid plan selected.")
 
     try:
-        session = stripe.checkout.Session.create(
-            mode="subscription",
-            payment_method_types=["card"],
-            line_items=[
-                {
-                    "price": price_id,
-                    "quantity": 1,
-                }
-            ],
-            customer_email=payload.email,
-            success_url=os.getenv("SUCCESS_URL", "") + "?status=success",
-            cancel_url=os.getenv("CANCEL_URL", "") + "?status=cancel",
-        )
+      session = stripe.checkout.Session.create(
+    mode="subscription",
+    success_url=SUCCESS_URL,
+    cancel_url=CANCEL_URL,
+    customer_email=data.email,
+    line_items=[{"price": data.price_id, "quantity": 1}],
+    allow_promotion_codes=True,  # 🔹 this makes the coupon / promo box appear
+)
+
+
     except Exception as exc:
         raise HTTPException(status_code=500, detail=str(exc))
 
