@@ -1,6 +1,7 @@
 import json
 import logging
 import os
+from typing import List
 
 import stripe
 from fastapi import FastAPI, Header, HTTPException, Request
@@ -31,7 +32,9 @@ SUCCESS_URL = os.environ.get("SUCCESS_URL")  # e.g. https://your-app.onrender.co
 CANCEL_URL = os.environ.get("CANCEL_URL", SUCCESS_URL or "")
 
 if not all([PRICE_BASIC, PRICE_PRO, PRICE_ENTERPRISE]):
-    logger.warning("One or more Stripe price IDs (PRICE_BASIC/PRO/ENTERPRISE) are not set.")
+    logger.warning(
+        "One or more Stripe price IDs (PRICE_BASIC/PRO/ENTERPRISE) are not set."
+    )
 
 PLAN_TO_PRICE = {
     "basic": PRICE_BASIC,
@@ -41,6 +44,7 @@ PLAN_TO_PRICE = {
 
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
 
+# Will pick up OPENAI_API_KEY from the environment
 client = OpenAI()
 
 # ---------- FastAPI app ----------
@@ -76,13 +80,15 @@ class CheckoutResponse(BaseModel):
     checkout_url: str
 
 
-# ---------- Routes ----------
+# ---------- Health ----------
 
 
 @app.get("/health")
 async def health():
     return {"status": "ok"}
 
+
+# ---------- Business summarization ----------
 
 BUSINESS_SYSTEM_PROMPT = (
     "You are an AI assistant that summarizes business documents for non-technical readers. "
@@ -96,29 +102,130 @@ BUSINESS_SYSTEM_PROMPT = (
     "neutral and business-friendly."
 )
 
+# Rough safety limit for characters per chunk.
+# This keeps each OpenAI request within a safe token window.
+CHARS_PER_CHUNK = 12000
+MAX_CHUNKS = 8  # safety cap so we don't accidentally fire hundreds of requests
+
+
+def _summarize_chunk(text: str, part_idx: int | None = None, total_parts: int | None = None) -> str:
+    """
+    Summarize a single chunk of text with the business system prompt.
+    """
+    user_content = text
+    if part_idx is not None and total_parts is not None:
+        user_content = (
+            f"This is part {part_idx} of {total_parts} of a longer business document.\n\n"
+            f"{text}"
+        )
+
+    completion = client.chat.completions.create(
+        model=OPENAI_MODEL,
+        messages=[
+            {"role": "system", "content": BUSINESS_SYSTEM_PROMPT},
+            {"role": "user", "content": user_content},
+        ],
+        temperature=0.3,
+        max_tokens=800,
+    )
+
+    return (completion.choices[0].message.content or "").strip()
+
+
+def _chunk_text(text: str, max_chars: int) -> List[str]:
+    """
+    Split a long string into chunks of at most max_chars characters,
+    trying to split on paragraph boundaries where possible.
+    """
+    if len(text) <= max_chars:
+        return [text]
+
+    chunks: List[str] = []
+    start = 0
+    length = len(text)
+
+    while start < length and len(chunks) < MAX_CHUNKS:
+        end = min(start + max_chars, length)
+
+        # Try to back up to the last newline to avoid chopping paragraphs in half
+        newline_pos = text.rfind("\n", start, end)
+        if newline_pos != -1 and newline_pos > start + max_chars // 2:
+            end = newline_pos
+
+        chunks.append(text[start:end])
+        start = end
+
+    # If there is still text left beyond MAX_CHUNKS, we ignore it for now.
+    # You could also choose to merge it into the last chunk instead.
+    return chunks
+
 
 @app.post("/summarize", response_model=SummarizeResponse)
 async def summarize(body: SummarizeRequest):
-    text = body.text.strip()
+    """
+    Summarize a business document. For large inputs, we:
+      1) Split the text into chunks.
+      2) Summarize each chunk.
+      3) Ask the model to combine those partial summaries into one final summary.
+    """
+    raw_text = body.text or ""
+    text = raw_text.strip()
+
     if not text:
         raise HTTPException(status_code=400, detail="Text is empty")
 
     try:
+        # 1) Split into chunks if needed
+        chunks = _chunk_text(text, CHARS_PER_CHUNK)
+        logger.info("Summarizing document with %d chunk(s)", len(chunks))
+
+        # 2) If it's short enough, just do a single call
+        if len(chunks) == 1:
+            summary = _summarize_chunk(chunks[0])
+            return SummarizeResponse(summary=summary)
+
+        # 3) Otherwise summarize each chunk separately
+        partial_summaries: List[str] = []
+        total_parts = len(chunks)
+
+        for idx, chunk in enumerate(chunks, start=1):
+            part_summary = _summarize_chunk(chunk, part_idx=idx, total_parts=total_parts)
+            partial_summaries.append(f"Part {idx} summary:\n{part_summary}")
+
+        # 4) Combine partial summaries into one concise business summary
+        combine_system_prompt = (
+            "You are an expert business analyst. You will be given summaries of parts of a larger "
+            "business document. Combine them into a single, clear summary that a non-technical client "
+            "or business stakeholder can quickly understand.\n\n"
+            "Your output should be 8–12 short bullet points under clear headings if appropriate. "
+            "Avoid repeating the same information."
+        )
+
+        combined_input = "\n\n".join(partial_summaries)
+
         completion = client.chat.completions.create(
             model=OPENAI_MODEL,
             messages=[
-                {"role": "system", "content": BUSINESS_SYSTEM_PROMPT},
-                {"role": "user", "content": text},
+                {"role": "system", "content": combine_system_prompt},
+                {"role": "user", "content": combined_input},
             ],
             temperature=0.3,
-            max_tokens=800,
+            max_tokens=900,
         )
 
-        summary = completion.choices[0].message.content.strip()
-        return SummarizeResponse(summary=summary)
+        final_summary = (completion.choices[0].message.content or "").strip()
+        return SummarizeResponse(summary=final_summary)
+
     except Exception as exc:
         logger.exception("Error during OpenAI summarization")
-        raise HTTPException(status_code=500, detail=str(exc))
+        # Surface a friendly message; log has the details.
+        raise HTTPException(
+            status_code=500,
+            detail="Backend summarization error. Please check the server logs for details.",
+        ) from exc
+
+
+# ---------- Stripe checkout ----------
 
 
 @app.post("/create-checkout-session", response_model=CheckoutResponse)
@@ -146,18 +253,22 @@ async def create_checkout_session(body: CheckoutRequest):
                     "quantity": 1,
                 }
             ],
-            # These URLs control where Stripe sends the user after checkout
             success_url=f"{SUCCESS_URL}?status=success&session_id={{CHECKOUT_SESSION_ID}}",
             cancel_url=f"{CANCEL_URL}?status=cancelled" if CANCEL_URL else SUCCESS_URL,
             allow_promotion_codes=True,  # enables coupon / promo code field
             billing_address_collection="auto",
         )
 
-        logger.info("Created checkout session %s for %s (%s)", session.id, body.email, plan)
+        logger.info(
+            "Created checkout session %s for %s (%s)", session.id, body.email, plan
+        )
         return CheckoutResponse(checkout_url=session.url)
     except Exception as exc:
         logger.exception("Error creating Stripe Checkout session")
         raise HTTPException(status_code=500, detail=str(exc))
+
+
+# ---------- Stripe webhook ----------
 
 
 @app.post("/webhook")
