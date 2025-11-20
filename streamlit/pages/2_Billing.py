@@ -2,132 +2,186 @@ import os
 import requests
 import streamlit as st
 
-st.set_page_config(
-    page_title="Billing & Plans – AI Report",
-    page_icon="💳",
-    layout="centered",
-)
-
-BACKEND_URL = os.getenv("BACKEND_URL", "").rstrip("/")
+# -----------------------------------------------------------------------------
+# Config
+# -----------------------------------------------------------------------------
+st.set_page_config(page_title="Billing & Plans", page_icon="💳")
 
 st.title("Billing & Plans")
-st.caption("Choose a plan and manage your subscription.")
 
+# Where your backend (FastAPI) is hosted
+BACKEND_URL = os.getenv(
+    "BACKEND_URL",
+    "https://ai-report-backend-ubrx.onrender.com"  # <-- your current backend URL
+)
+
+# Base URL of this Streamlit app
+FRONTEND_URL = os.getenv(
+    "FRONTEND_URL",
+    "https://ai-report-saas.onrender.com"  # <-- can override via env if needed
+)
+
+SUCCESS_URL = FRONTEND_URL + "/Billing?status=success"
+CANCEL_URL = FRONTEND_URL + "/Billing?status=cancelled"
+
+# Same plan IDs you configured in your backend / Stripe
+PLANS = {
+    "basic": {
+        "name": "Basic",
+        "price_id": os.getenv("PRICE_BASIC", ""),  # optional; backend can map instead
+        "price_label": "$9.99 / month",
+        "bullets": [
+            "Upload up to 5 documents per month",
+            "Clear AI-generated summaries for clients and stakeholders",
+            "Copy-paste summaries into emails, reports, and slide decks",
+        ],
+    },
+    "pro": {
+        "name": "Pro",
+        "price_id": os.getenv("PRICE_PRO", ""),
+        "price_label": "$19.99 / month",
+        "bullets": [
+            "Upload up to 30 documents per month",
+            "Deeper, more structured summaries (key points, risks, and action items)",
+            "Priority email support",
+        ],
+    },
+    "enterprise": {
+        "name": "Enterprise",
+        "price_id": os.getenv("PRICE_ENTERPRISE", ""),
+        "price_label": "$39.99 / month",
+        "bullets": [
+            "Unlimited uploads for your team",
+            "Team accounts and shared templates",
+            "Premium support & integration help",
+        ],
+    },
+}
+
+
+# -----------------------------------------------------------------------------
+# Helper to call backend
+# -----------------------------------------------------------------------------
+def start_checkout(plan_key: str, email: str) -> str | None:
+    """
+    Ask the backend to create a Stripe Checkout session and return the URL.
+    """
+    plan = PLANS[plan_key]
+
+    # You can either send price_id here, or just send the plan_key and let
+    # the backend map it to the right Stripe price. This example sends both.
+    payload = {
+        "plan": plan_key,
+        "price_id": plan["price_id"] or None,
+        "customer_email": email,
+        "success_url": SUCCESS_URL,
+        "cancel_url": CANCEL_URL,
+    }
+
+    try:
+        resp = requests.post(f"{BACKEND_URL}/create-checkout-session", json=payload, timeout=20)
+        resp.raise_for_status()
+    except Exception as e:
+        st.error(f"Checkout failed: {e}")
+        return None
+
+    data = resp.json()
+    checkout_url = data.get("checkout_url") or data.get("url")
+    if not checkout_url:
+        st.error("Checkout failed: backend did not return a checkout URL.")
+        return None
+
+    return checkout_url
+
+
+# -----------------------------------------------------------------------------
+# UI
+# -----------------------------------------------------------------------------
+st.write(
+    "Use this page to manage your subscription and upgrade your document "
+    "summary limits."
+)
+
+# Email
 st.subheader("Your email")
-st.caption("We use this email to link your subscription, upload limits, and summaries.")
-email = st.text_input("Email address", placeholder="you@example.com")
+email = st.text_input(
+    "Email address",
+    placeholder="you@example.com",
+    help="We use this email to link your subscription, upload limits, and summaries.",
+)
 
 st.markdown("---")
 
-if not email:
-    st.info("Enter your email first, then choose a plan.")
-    st.stop()
+# Show any status from query params (e.g. after Stripe redirect)
+qp = st.experimental_get_query_params()
+status = qp.get("status", [None])[0]
+
+if status == "success":
+    st.success("✅ Payment successful. Your subscription has been updated.")
+elif status == "cancelled":
+    st.info("Payment canceled. You can try again or choose a different plan.")
 
 
-def create_checkout_session(plan: str) -> dict:
-    """Ask backend to create a Stripe Checkout Session."""
-    if not BACKEND_URL:
-        return {"error": "BACKEND_URL is not configured."}
-
-    try:
-        resp = requests.post(
-            f"{BACKEND_URL}/create-checkout-session",
-            json={
-                "email": email,
-                "plan": plan,  # 'basic', 'pro', 'enterprise'
-            },
-            timeout=30,
-        )
-    except Exception as exc:
-        return {"error": f"Network error: {exc}"}
-
-    if resp.status_code != 200:
-        try:
-            data = resp.json()
-        except Exception:
-            data = {}
-        msg = data.get("detail") or f"Backend error ({resp.status_code})"
-        return {"error": msg}
-
-    return resp.json()
-
+st.subheader("Plans")
 
 cols = st.columns(3)
 
-# -------- BASIC ---------- #
+# ---- Basic Plan ----
 with cols[0]:
-    st.subheader("Basic")
-    st.write("**$9.99 / month**")
-    st.markdown(
-        """
-- Upload up to **5 documents per month**
-- Clear AI-generated summaries for clients and stakeholders
-- Copy-paste summaries into emails, reports, and slide decks
-"""
-    )
-    if st.button("Choose Basic"):
-        result = create_checkout_session("basic")
-        if "error" in result:
-            st.error(f"Checkout failed: {result['error']}")
-        else:
-            checkout_url = result.get("checkout_url")
-            if checkout_url:
-                st.success("Redirecting you to secure checkout…")
-                st.markdown(f"[Click here to complete checkout]({checkout_url})")
-            else:
-                st.error("Backend did not return a checkout URL.")
+    plan = PLANS["basic"]
+    st.markdown(f"### {plan['name']}")
+    st.caption(plan["price_label"])
+    for bullet in plan["bullets"]:
+        st.markdown(f"- {bullet}")
 
-# -------- PRO ---------- #
+    if st.button("Choose Basic", key="choose_basic", use_container_width=True):
+        if not email.strip():
+            st.warning("Please enter your email before choosing a plan.")
+        else:
+            url = start_checkout("basic", email.strip())
+            if url:
+                st.experimental_set_query_params()  # clear params
+                st.experimental_rerun()  # let Streamlit reload before redirect
+                st.markdown(f'<meta http-equiv="refresh" content="0; url={url}">', unsafe_allow_html=True)
+
+# ---- Pro Plan ----
 with cols[1]:
-    st.subheader("Pro")
-    st.write("**$19.99 / month**")
-    st.markdown(
-        """
-- Upload up to **30 documents per month**
-- Deeper, more structured summaries (key points, risks, and action items)
-- Priority email support
-"""
-    )
-    if st.button("Choose Pro"):
-        result = create_checkout_session("pro")
-        if "error" in result:
-            st.error(f"Checkout failed: {result['error']}")
-        else:
-            checkout_url = result.get("checkout_url")
-            if checkout_url:
-                st.success("Redirecting you to secure checkout…")
-                st.markdown(f"[Click here to complete checkout]({checkout_url})")
-            else:
-                st.error("Backend did not return a checkout URL.")
+    plan = PLANS["pro"]
+    st.markdown(f"### {plan['name']}")
+    st.caption(plan["price_label"])
+    for bullet in plan["bullets"]:
+        st.markdown(f"- {bullet}")
 
-# -------- ENTERPRISE ---------- #
+    if st.button("Choose Pro", key="choose_pro", use_container_width=True):
+        if not email.strip():
+            st.warning("Please enter your email before choosing a plan.")
+        else:
+            url = start_checkout("pro", email.strip())
+            if url:
+                st.experimental_set_query_params()
+                st.experimental_rerun()
+                st.markdown(f'<meta http-equiv="refresh" content="0; url={url}">', unsafe_allow_html=True)
+
+# ---- Enterprise Plan ----
 with cols[2]:
-    st.subheader("Enterprise")
-    st.write("**$39.99 / month**")
-    st.markdown(
-        """
-- **Unlimited uploads** for your team
-- Team accounts and shared templates
-- Premium support & integration help
-"""
-    )
-    if st.button("Choose Enterprise"):
-        result = create_checkout_session("enterprise")
-        if "error" in result:
-            st.error(f"Checkout failed: {result['error']}")
+    plan = PLANS["enterprise"]
+    st.markdown(f"### {plan['name']}")
+    st.caption(plan["price_label"])
+    for bullet in plan["bullets"]:
+        st.markdown(f"- {bullet}")
+
+    if st.button("Choose Enterprise", key="choose_enterprise", use_container_width=True):
+        if not email.strip():
+            st.warning("Please enter your email before choosing a plan.")
         else:
-            checkout_url = result.get("checkout_url")
-            if checkout_url:
-                st.success("Redirecting you to secure checkout…")
-                st.markdown(f"[Click here to complete checkout]({checkout_url})")
-            else:
-                st.error("Backend did not return a checkout URL.")
+            url = start_checkout("enterprise", email.strip())
+            if url:
+                st.experimental_set_query_params()
+                st.experimental_rerun()
+                st.markdown(f'<meta http-equiv="refresh" content="0; url={url}">', unsafe_allow_html=True)
 
-st.markdown(
-    """
----
-
-After a successful checkout, your plan will be updated automatically and your upload
-limits will adjust on the **Upload Data** page.
-"""
+st.markdown("---")
+st.caption(
+    "After a successful checkout, your plan will be updated automatically and your "
+    "upload limits will adjust on the **Upload Data** page."
 )
