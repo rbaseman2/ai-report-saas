@@ -1,308 +1,229 @@
-import json
-import logging
 import os
-from typing import List
+import logging
+from typing import Optional, Literal
 
-import stripe
-from fastapi import FastAPI, Header, HTTPException, Request
+from fastapi import FastAPI, HTTPException, Request, Header
 from fastapi.middleware.cors import CORSMiddleware
-from openai import OpenAI
 from pydantic import BaseModel
 
-# ---------- Logging ----------
+import stripe
+from openai import OpenAI
 
+# ---------------------------------------------------------------------
+# Configuration & clients
+# ---------------------------------------------------------------------
+
+logger = logging.getLogger("ai-report-backend")
 logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
 
-# ---------- Environment ----------
+STRIPE_SECRET_KEY = os.getenv("STRIPE_SECRET_KEY", "")
+PRICE_BASIC = os.getenv("PRICE_BASIC", "")
+PRICE_PRO = os.getenv("PRICE_PRO", "")
+PRICE_ENTERPRISE = os.getenv("PRICE_ENTERPRISE", "")
+STRIPE_WEBHOOK_SECRET = os.getenv("STRIPE_WEBHOOK_SECRET", "")
 
-STRIPE_SECRET_KEY = os.environ.get("STRIPE_SECRET_KEY")
+FRONTEND_URL = os.getenv("FRONTEND_URL", "http://localhost:8501")
+SUCCESS_URL = os.getenv("SUCCESS_URL", f"{FRONTEND_URL}/Billing")
+
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
+
 if not STRIPE_SECRET_KEY:
-    raise RuntimeError("STRIPE_SECRET_KEY is not set")
+    logger.warning("STRIPE_SECRET_KEY is not set. Checkout will fail until configured.")
+
+if not OPENAI_API_KEY:
+    logger.warning("OPENAI_API_KEY is not set. Summaries will fail until configured.")
 
 stripe.api_key = STRIPE_SECRET_KEY
+openai_client = OpenAI(api_key=OPENAI_API_KEY)
 
-STRIPE_WEBHOOK_SECRET = os.getenv("STRIPE_WEBHOOK_SECRET")
-
-PRICE_BASIC = os.environ.get("PRICE_BASIC")
-PRICE_PRO = os.environ.get("PRICE_PRO")
-PRICE_ENTERPRISE = os.environ.get("PRICE_ENTERPRISE")
-
-SUCCESS_URL = os.environ.get("SUCCESS_URL")  # e.g. https://your-app.onrender.com/Billing
-CANCEL_URL = os.environ.get("CANCEL_URL", SUCCESS_URL or "")
-
-if not all([PRICE_BASIC, PRICE_PRO, PRICE_ENTERPRISE]):
-    logger.warning(
-        "One or more Stripe price IDs (PRICE_BASIC/PRO/ENTERPRISE) are not set."
-    )
-
-PLAN_TO_PRICE = {
-    "basic": PRICE_BASIC,
-    "pro": PRICE_PRO,
-    "enterprise": PRICE_ENTERPRISE,
-}
-
-OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
-
-# Will pick up OPENAI_API_KEY from the environment
-client = OpenAI()
-
-# ---------- FastAPI app ----------
+# ---------------------------------------------------------------------
+# FastAPI app setup
+# ---------------------------------------------------------------------
 
 app = FastAPI(title="AI Report Backend")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # you can tighten this to your frontend URL if you like
+    allow_origins=[FRONTEND_URL, FRONTEND_URL.rstrip("/")],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# ---------- Pydantic models ----------
+# ---------------------------------------------------------------------
+# Models
+# ---------------------------------------------------------------------
 
-
-class SummarizeRequest(BaseModel):
+class SummaryRequest(BaseModel):
     text: str
-    email: str | None = None
+    email: Optional[str] = None
+    tier: Optional[Literal["free", "basic", "pro", "enterprise"]] = "free"
 
 
-class SummarizeResponse(BaseModel):
+class SummaryResponse(BaseModel):
     summary: str
 
 
 class CheckoutRequest(BaseModel):
+    plan: Literal["basic", "pro", "enterprise"]
     email: str
-    plan: str  # "basic", "pro", "enterprise"
+    coupon: Optional[str] = None  # optional coupon code from the UI
 
 
 class CheckoutResponse(BaseModel):
-    checkout_url: str
+    url: str
 
 
-# ---------- Health ----------
+# ---------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------
 
+def _plan_to_price_id(plan: str) -> str:
+    plan = plan.lower()
+    if plan == "basic":
+        return PRICE_BASIC
+    if plan == "pro":
+        return PRICE_PRO
+    if plan == "enterprise":
+        return PRICE_ENTERPRISE
+    raise ValueError(f"Unknown plan: {plan}")
+
+
+def _truncate_text_for_model(text: str, max_chars: int = 20000) -> str:
+    """
+    Very simple safety guard so we don't try to send a 1.8M-character payload
+    to the model. You can make this smarter later (chunking, etc.).
+    """
+    if len(text) > max_chars:
+        logger.info("Input text length %s > %s, truncating", len(text), max_chars)
+        return text[:max_chars]
+    return text
+
+
+# ---------------------------------------------------------------------
+# Routes
+# ---------------------------------------------------------------------
 
 @app.get("/health")
 async def health():
     return {"status": "ok"}
 
 
-# ---------- Business summarization ----------
-
-BUSINESS_SYSTEM_PROMPT = (
-    "You are an AI assistant that summarizes business documents for non-technical readers. "
-    "Your audience might be clients, managers, or stakeholders who need a clear, concise view "
-    "of the key points. Focus on:\n"
-    "- Main objectives and context\n"
-    "- Key insights, decisions, or results\n"
-    "- Risks, issues, or concerns (if any)\n"
-    "- Recommended next steps or actions\n\n"
-    "Write in clear, professional language. Avoid jargon where possible, and keep the tone "
-    "neutral and business-friendly."
-)
-
-# Rough safety limit for characters per chunk.
-# This keeps each OpenAI request within a safe token window.
-CHARS_PER_CHUNK = 12000
-MAX_CHUNKS = 8  # safety cap so we don't accidentally fire hundreds of requests
-
-
-def _summarize_chunk(text: str, part_idx: int | None = None, total_parts: int | None = None) -> str:
+@app.post("/summarize", response_model=SummaryResponse)
+async def summarize(payload: SummaryRequest):
     """
-    Summarize a single chunk of text with the business system prompt.
+    Summarize long reports/notes into a business-friendly summary.
     """
-    user_content = text
-    if part_idx is not None and total_parts is not None:
-        user_content = (
-            f"This is part {part_idx} of {total_parts} of a longer business document.\n\n"
-            f"{text}"
-        )
-
-    completion = client.chat.completions.create(
-        model=OPENAI_MODEL,
-        messages=[
-            {"role": "system", "content": BUSINESS_SYSTEM_PROMPT},
-            {"role": "user", "content": user_content},
-        ],
-        temperature=0.3,
-        max_tokens=800,
-    )
-
-    return (completion.choices[0].message.content or "").strip()
-
-
-def _chunk_text(text: str, max_chars: int) -> List[str]:
-    """
-    Split a long string into chunks of at most max_chars characters,
-    trying to split on paragraph boundaries where possible.
-    """
-    if len(text) <= max_chars:
-        return [text]
-
-    chunks: List[str] = []
-    start = 0
-    length = len(text)
-
-    while start < length and len(chunks) < MAX_CHUNKS:
-        end = min(start + max_chars, length)
-
-        # Try to back up to the last newline to avoid chopping paragraphs in half
-        newline_pos = text.rfind("\n", start, end)
-        if newline_pos != -1 and newline_pos > start + max_chars // 2:
-            end = newline_pos
-
-        chunks.append(text[start:end])
-        start = end
-
-    # If there is still text left beyond MAX_CHUNKS, we ignore it for now.
-    # You could also choose to merge it into the last chunk instead.
-    return chunks
-
-
-@app.post("/summarize", response_model=SummarizeResponse)
-async def summarize(body: SummarizeRequest):
-    """
-    Summarize a business document. For large inputs, we:
-      1) Split the text into chunks.
-      2) Summarize each chunk.
-      3) Ask the model to combine those partial summaries into one final summary.
-    """
-    raw_text = body.text or ""
-    text = raw_text.strip()
-
-    if not text:
-        raise HTTPException(status_code=400, detail="Text is empty")
-
-    try:
-        # 1) Split into chunks if needed
-        chunks = _chunk_text(text, CHARS_PER_CHUNK)
-        logger.info("Summarizing document with %d chunk(s)", len(chunks))
-
-        # 2) If it's short enough, just do a single call
-        if len(chunks) == 1:
-            summary = _summarize_chunk(chunks[0])
-            return SummarizeResponse(summary=summary)
-
-        # 3) Otherwise summarize each chunk separately
-        partial_summaries: List[str] = []
-        total_parts = len(chunks)
-
-        for idx, chunk in enumerate(chunks, start=1):
-            part_summary = _summarize_chunk(chunk, part_idx=idx, total_parts=total_parts)
-            partial_summaries.append(f"Part {idx} summary:\n{part_summary}")
-
-        # 4) Combine partial summaries into one concise business summary
-        combine_system_prompt = (
-            "You are an expert business analyst. You will be given summaries of parts of a larger "
-            "business document. Combine them into a single, clear summary that a non-technical client "
-            "or business stakeholder can quickly understand.\n\n"
-            "Your output should be 8–12 short bullet points under clear headings if appropriate. "
-            "Avoid repeating the same information."
-        )
-
-        combined_input = "\n\n".join(partial_summaries)
-
-        completion = client.chat.completions.create(
-            model=OPENAI_MODEL,
-            messages=[
-                {"role": "system", "content": combine_system_prompt},
-                {"role": "user", "content": combined_input},
-            ],
-            temperature=0.3,
-            max_tokens=900,
-        )
-
-        final_summary = (completion.choices[0].message.content or "").strip()
-        return SummarizeResponse(summary=final_summary)
-
-    except Exception as exc:
-        logger.exception("Error during OpenAI summarization")
-        # Surface a friendly message; log has the details.
+    if not OPENAI_API_KEY:
         raise HTTPException(
             status_code=500,
-            detail="Backend summarization error. Please check the server logs for details.",
-        ) from exc
+            detail="OPENAI_API_KEY is not configured on the server.",
+        )
 
+    if not payload.text or not payload.text.strip():
+        raise HTTPException(status_code=400, detail="No text provided for summarization.")
 
-# ---------- Stripe checkout ----------
+    # Light guard against huge texts
+    text = _truncate_text_for_model(payload.text)
+
+    # You can vary behavior by tier if you want (e.g., longer summary for pro/enterprise)
+    tier = (payload.tier or "free").lower()
+
+    # Build a business-oriented prompt
+    system_prompt = (
+        "You are a professional business analyst. "
+        "Given a long document or set of notes, you create a clear, concise summary "
+        "that a non-technical client or business stakeholder can quickly understand. "
+        "Highlight key points, decisions, risks, and any next steps. Avoid medical language."
+    )
+
+    user_prompt = (
+        "Summarize the following content for a business client or audience. "
+        "Focus on key insights, decisions, metrics, risks, and recommended next actions.\n\n"
+        f"--- DOCUMENT START ---\n{text}\n--- DOCUMENT END ---"
+    )
+
+    try:
+        logger.info("Calling OpenAI for tier=%s", tier)
+        completion = openai_client.chat.completions.create(
+            model="gpt-4.1-mini",
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt},
+            ],
+            max_tokens=900,
+            temperature=0.3,
+        )
+        summary_text = completion.choices[0].message.content.strip()
+        return SummaryResponse(summary=summary_text)
+    except Exception as e:
+        logger.exception("Error while generating summary: %s", e)
+        raise HTTPException(status_code=500, detail=f"Failed to generate summary: {e}")
 
 
 @app.post("/create-checkout-session", response_model=CheckoutResponse)
-async def create_checkout_session(body: CheckoutRequest):
-    plan = body.plan.lower()
-    price_id = PLAN_TO_PRICE.get(plan)
-
-    if not price_id:
-        raise HTTPException(status_code=400, detail=f"Unknown plan: {body.plan}")
-
-    if not SUCCESS_URL:
+async def create_checkout_session(payload: CheckoutRequest):
+    """
+    Create a Stripe Checkout Session for subscription.
+    The Streamlit Billing page should POST here with {plan, email, coupon?}.
+    """
+    if not STRIPE_SECRET_KEY:
         raise HTTPException(
             status_code=500,
-            detail="SUCCESS_URL is not configured in the backend environment.",
+            detail="Stripe is not configured on the server.",
         )
 
     try:
-        # Stripe Checkout for subscriptions
-        session = stripe.checkout.Session.create(
-            mode="subscription",
-            customer_email=body.email,
-            line_items=[
-                {
-                    "price": price_id,
-                    "quantity": 1,
-                }
-            ],
-            success_url=f"{SUCCESS_URL}?status=success&session_id={{CHECKOUT_SESSION_ID}}",
-            cancel_url=f"{CANCEL_URL}?status=cancelled" if CANCEL_URL else SUCCESS_URL,
-            allow_promotion_codes=True,  # enables coupon / promo code field
-            billing_address_collection="auto",
-        )
+        price_id = _plan_to_price_id(payload.plan)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
 
-        logger.info(
-            "Created checkout session %s for %s (%s)", session.id, body.email, plan
-        )
-        return CheckoutResponse(checkout_url=session.url)
-    except Exception as exc:
-        logger.exception("Error creating Stripe Checkout session")
-        raise HTTPException(status_code=500, detail=str(exc))
+    # Final success/cancel URLs. Stripe will substitute the session id.
+    success_url = f"{SUCCESS_URL}?status=success&session_id={{CHECKOUT_SESSION_ID}}"
+    cancel_url = f"{SUCCESS_URL}?status=cancelled"
+
+    checkout_kwargs = {
+        "success_url": success_url,
+        "cancel_url": cancel_url,
+        "mode": "subscription",
+        "payment_method_types": ["card"],
+        "line_items": [{"price": price_id, "quantity": 1}],
+        "customer_email": payload.email,
+        "allow_promotion_codes": True,  # also allow built-in coupons
+    }
+
+    # Optional explicit coupon code (requires corresponding Stripe coupon)
+    if payload.coupon:
+        checkout_kwargs["discounts"] = [{"coupon": payload.coupon}]
+
+    try:
+        session = stripe.checkout.Session.create(**checkout_kwargs)
+        logger.info("Created Stripe session %s for %s (%s)", session.id, payload.email, payload.plan)
+        return CheckoutResponse(url=session.url)
+    except Exception as e:
+        logger.exception("Error creating checkout session: %s", e)
+        raise HTTPException(status_code=500, detail=f"Stripe checkout error: {e}")
 
 
-# ---------- Stripe webhook ----------
+# Optional: Stripe webhook endpoint (for future subscription tracking)
+@app.post("/stripe/webhook")
+async def stripe_webhook(request: Request, stripe_signature: str = Header(None, alias="Stripe-Signature")):
+    if not STRIPE_WEBHOOK_SECRET:
+        # If you haven't configured this yet, just acknowledge so Stripe stops retrying
+        logger.warning("Received Stripe webhook but STRIPE_WEBHOOK_SECRET is not set.")
+        return {"received": True}
 
-
-@app.post("/webhook")
-async def stripe_webhook(
-    request: Request,
-    stripe_signature: str | None = Header(default=None, alias="Stripe-Signature"),
-):
-    """
-    Basic Stripe webhook handler.
-    Right now this just verifies the signature (if configured) and logs the event.
-    You can extend this later to store subscription status in a database.
-    """
     payload = await request.body()
-
     try:
-        if STRIPE_WEBHOOK_SECRET and stripe_signature:
-            event = stripe.Webhook.construct_event(
-                payload=payload,
-                sig_header=stripe_signature,
-                secret=STRIPE_WEBHOOK_SECRET,
-            )
-        else:
-            # No verification – for local testing only
-            event = json.loads(payload.decode("utf-8"))
-    except Exception as exc:
-        logger.exception("Failed to parse Stripe webhook")
-        raise HTTPException(status_code=400, detail=f"Webhook error: {exc}")
+        event = stripe.Webhook.construct_event(
+            payload=payload,
+            sig_header=stripe_signature,
+            secret=STRIPE_WEBHOOK_SECRET,
+        )
+    except Exception as e:
+        logger.warning("Failed to verify Stripe webhook: %s", e)
+        raise HTTPException(status_code=400, detail="Invalid Stripe signature.")
 
-    event_type = event.get("type")
-    logger.info("Received Stripe event: %s", event_type)
-
-    # Example places to extend logic:
-    # - checkout.session.completed
-    # - customer.subscription.updated
-    # - customer.subscription.deleted
-
+    # You can extend this to persist subscription info, etc.
+    logger.info("Received Stripe event: %s", event["type"])
     return {"received": True}
