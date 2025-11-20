@@ -2,25 +2,35 @@ import os
 import requests
 import streamlit as st
 
-# Must be first Streamlit call
+# -------------------------------------------------------------------
+# Page config (must be first Streamlit call)
+# -------------------------------------------------------------------
 st.set_page_config(
     page_title="Billing & Plans – AI Report",
     page_icon="💳",
     layout="wide",
 )
 
+# Backend URL – set in Render as BACKEND_URL (falls back to localhost for dev)
 BACKEND_URL = os.getenv("BACKEND_URL", "http://localhost:8000").rstrip("/")
 
 st.title("Billing & Plans")
-
 st.caption(
     "Use this page to manage your subscription and upgrade your document summary limits."
 )
 
-# ---------- Query params (e.g. after redirect back from Stripe) ----------
+# Optional: show which backend we're talking to (helps when debugging)
+st.caption(f"Using backend: {BACKEND_URL}")
 
-params = st.query_params
-status = params.get("status")
+# -------------------------------------------------------------------
+# Query params (e.g. after redirect back from Stripe)
+# -------------------------------------------------------------------
+qp = st.query_params
+status = qp.get("status")
+# st.query_params values are lists; normalize to a single string
+if isinstance(status, list):
+    status = status[0]
+
 if status == "success":
     st.success("Your subscription was completed successfully.")
 elif status == "cancelled":
@@ -30,12 +40,13 @@ elif status == "error":
 
 st.markdown("---")
 
-# ---------- Email capture ----------
-
+# -------------------------------------------------------------------
+# Email capture
+# -------------------------------------------------------------------
 st.markdown("### Your email")
 st.caption(
     "We use this email to link your subscription, upload limits, and summaries. "
-    "Use the same one you enter on the Stripe checkout page."
+    "Use the same address you enter on the Stripe checkout page."
 )
 
 default_email = st.session_state.get("user_email", "")
@@ -50,41 +61,57 @@ if st.button("Save email"):
 
 st.markdown("---")
 
-# ---------- Plan cards ----------
+# -------------------------------------------------------------------
+# Helper: start checkout via backend
+# -------------------------------------------------------------------
+def start_checkout(plan: str) -> None:
+    """
+    Call the FastAPI backend to create a Stripe Checkout Session
+    and return a link the user can click.
 
-st.markdown("### Plans")
-
-col_basic, col_pro, col_ent = st.columns(3)
-
-
-def start_checkout(plan: str):
-    """Call backend to create a Stripe Checkout Session and give the user the link."""
+    plan: "basic" | "pro" | "enterprise"
+    """
     if not email:
         st.warning("Please enter and save your email before choosing a plan.")
         return
 
+    payload = {"email": email, "plan": plan}
+
     try:
-        payload = {"email": email, "plan": plan}
-        resp = requests.post(
-            f"{BACKEND_URL}/create-checkout-session",
-            json=payload,
-            timeout=30,
-        )
+        with st.spinner("Contacting secure payment server…"):
+            resp = requests.post(
+                f"{BACKEND_URL}/create-checkout-session",
+                json=payload,
+                timeout=60,  # give Render time to wake the backend
+            )
         resp.raise_for_status()
         data = resp.json()
         checkout_url = data.get("checkout_url")
+
         if not checkout_url:
-            st.error("Backend did not return a checkout URL.")
+            st.error("Backend did not return a checkout URL. Please try again in a moment.")
             return
 
-        st.success("Checkout created. Click the button below to continue securely on Stripe.")
+        st.success("Checkout created. Click below to continue securely on Stripe:")
         st.markdown(
             f"[➡️ Open secure checkout]({checkout_url})",
             unsafe_allow_html=False,
         )
+
+    except requests.exceptions.Timeout:
+        st.error(
+            "The request to the payment server timed out. "
+            "If your backend was asleep, please wait a few seconds and try again."
+        )
     except Exception as exc:
         st.error(f"Checkout failed: {exc}")
 
+# -------------------------------------------------------------------
+# Plan cards
+# -------------------------------------------------------------------
+st.markdown("### Plans")
+
+col_basic, col_pro, col_ent = st.columns(3)
 
 with col_basic:
     st.subheader("Basic")
