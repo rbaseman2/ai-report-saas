@@ -1,107 +1,68 @@
-import os
-import requests
 import streamlit as st
 
-# IMPORTANT: must be first Streamlit command
+# Must be the first Streamlit call
 st.set_page_config(
-    page_title="AI Report – Business-Ready Summaries",
+    page_title="AI Report – Business Document Summaries",
     page_icon="📄",
     layout="wide",
 )
 
-BACKEND_URL = os.getenv("BACKEND_URL", "").rstrip("/")
+st.title("📄 AI Report")
+st.subheader("Turn long business documents into clear, client-ready summaries")
 
+st.write(
+    """
+AI Report helps consultants, freelancers, and small teams quickly turn long reports, 
+proposals, meeting notes, and PDFs into concise, easy-to-share summaries.
 
-def get_subscription_status(email: str) -> dict:
-    """Ask the backend what plan this email is on."""
-    if not BACKEND_URL or not email:
-        return {"plan": "free", "active": False}
-
-    try:
-        response = requests.get(
-            f"{BACKEND_URL}/subscription-status",
-            params={"email": email},
-            timeout=10,
-        )
-        if response.status_code == 200:
-            return response.json()
-    except Exception:
-        pass
-
-    return {"plan": "free", "active": False}
-
-
-# ---------------------- PAGE LAYOUT ---------------------- #
-
-st.title("AI Report – Turn Long Documents into Client-Ready Summaries")
-st.caption(
-    "Upload reports, meeting notes, proposals, or research and instantly get clear, "
-    "client-friendly summaries you can reuse in emails, slide decks, and internal updates."
+Upload your content once, and let AI create a summary you can send to clients, 
+stakeholders, or your internal team.
+"""
 )
 
-st.markdown("### How it works")
-cols = st.columns(3)
+st.markdown("---")
 
-with cols[0]:
-    st.subheader("1. Upload")
-    st.write(
-        "Drag and drop PDFs, Word docs, text files, or CSVs – or paste text directly. "
-        "Perfect for meeting notes, research, and long email threads."
+col1, col2 = st.columns(2)
+
+with col1:
+    st.markdown("### How it works")
+    st.markdown(
+        """
+1. **Upload your document** – PDF, Word, text, or CSV  
+2. **AI analyzes the content** – finds the key points, risks, and next steps  
+3. **Get a clean summary** – ready to paste into emails, reports, or slide decks  
+        """
     )
 
-with cols[1]:
-    st.subheader("2. Summarize")
-    st.write(
-        "Our AI condenses the content into clear, structured summaries written for "
-        "non-technical clients, managers, and stakeholders."
+    st.markdown("### What you can summarize")
+    st.markdown(
+        """
+- Project proposals and SOWs  
+- Meeting notes or discovery calls  
+- Research reports and analysis  
+- Process documentation and SOPs  
+- CSV exports (e.g. metrics, logs, simple datasets)  
+        """
     )
 
-with cols[2]:
-    st.subheader("3. Share")
-    st.write(
-        "Copy the summary into emails, proposals, or presentations. Save time while "
-        "still looking thoughtful and professional."
+with col2:
+    st.markdown("### Plans that grow with you")
+    st.markdown(
+        """
+- **Free** – Try the tool with shorter inputs and simpler summaries  
+- **Basic** – Perfect for solo users summarizing a few documents each month  
+- **Pro** – For consultants and power users handling client work regularly  
+- **Enterprise** – For teams that need higher volume and support  
+        """
     )
 
-st.divider()
-
-st.subheader("Your account")
-
-email = st.text_input(
-    "Email",
-    placeholder="you@example.com",
-    help="Use the same email you’ll use on the Billing page.",
-)
-
-status_col, info_col = st.columns([1, 2])
-
-with status_col:
-    if email:
-        status = get_subscription_status(email)
-        plan = status.get("plan", "free")
-        active = status.get("active", False)
-
-        if active:
-            st.success(f"Current plan: **{plan.capitalize()}**")
-        else:
-            st.info("You’re currently on the **Free** tier.")
-    else:
-        st.info("Enter your email to see your current plan.")
-
-with info_col:
-    st.write(
-        "Use the **Upload Data** page to generate summaries and the **Billing** page "
-        "to upgrade your plan or manage your subscription."
-    )
+st.markdown("---")
 
 st.markdown(
     """
----
+**Next steps**
 
-**Tip:** this tool is ideal for:
-
-- Consultants summarizing discovery calls or workshops  
-- Solo founders turning research into short updates  
-- Small teams sharing insights with non-technical stakeholders  
+- Go to the **Billing** page to choose a plan  
+- Then use **Upload Data** to generate your first summary  
 """
 )

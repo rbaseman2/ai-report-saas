@@ -2,171 +2,182 @@ import os
 import io
 import requests
 import streamlit as st
-from PyPDF2 import PdfReader
 
-# Must be first Streamlit command on the page
+from typing import Optional
+
+# Must be first Streamlit call
 st.set_page_config(
     page_title="Upload Data – AI Report",
     page_icon="📄",
     layout="wide",
 )
 
-BACKEND_URL = os.getenv("BACKEND_URL", "").rstrip("/")
+BACKEND_URL = os.getenv("BACKEND_URL", "http://localhost:8000").rstrip("/")
 
-
-# ---------------------- HELPERS ---------------------- #
-
-def extract_text_from_pdf(file) -> str:
-    """Extract text from a PDF file-like object."""
-    try:
-        reader = PdfReader(file)
-        pages = [page.extract_text() or "" for page in reader.pages]
-        return "\n\n".join(pages)
-    except Exception:
-        return ""
+# ---------- Helpers ----------
 
 
 def extract_text_from_file(uploaded_file) -> str:
-    """Handle txt, md, pdf, csv uniformly as plain text."""
+    """Convert an uploaded file into plain text."""
     if uploaded_file is None:
         return ""
 
-    filename = uploaded_file.name.lower()
+    name = uploaded_file.name.lower()
+    data = uploaded_file.read()
 
-    if filename.endswith(".pdf"):
-        return extract_text_from_pdf(uploaded_file)
-
-    try:
-        raw = uploaded_file.read()
-        try:
-            return raw.decode("utf-8")
-        except Exception:
-            return raw.decode("latin-1", errors="ignore")
-    finally:
+    # Make sure we can read it more than once
+    if hasattr(uploaded_file, "seek"):
         uploaded_file.seek(0)
 
+    # Simple text formats
+    if name.endswith((".txt", ".md", ".markdown")):
+        return data.decode("utf-8", errors="ignore")
 
-def get_subscription_status(email: str) -> dict:
-    if not BACKEND_URL or not email:
-        return {"plan": "free", "active": False}
-
-    try:
-        resp = requests.get(
-            f"{BACKEND_URL}/subscription-status",
-            params={"email": email},
-            timeout=10,
-        )
-        if resp.status_code == 200:
-            return resp.json()
-    except Exception:
-        pass
-    return {"plan": "free", "active": False}
-
-
-def summarize(email: str, text: str) -> dict:
-    """Call backend /summarize endpoint."""
-    if not BACKEND_URL:
-        return {"error": "Backend URL is not configured."}
-
-    payload = {"email": email, "text": text}
-    resp = requests.post(f"{BACKEND_URL}/summarize", json=payload, timeout=60)
-    if resp.status_code != 200:
+    # CSV -> treat as text table
+    if name.endswith(".csv"):
         try:
-            data = resp.json()
+            return data.decode("utf-8", errors="ignore")
         except Exception:
-            data = {}
-        msg = data.get("detail") or f"Backend error ({resp.status_code})"
-        return {"error": msg}
-    return resp.json()
+            return ""
+
+    # PDF
+    if name.endswith(".pdf"):
+        try:
+            from PyPDF2 import PdfReader
+
+            reader = PdfReader(io.BytesIO(data))
+            pages = []
+            for page in reader.pages:
+                text = page.extract_text() or ""
+                pages.append(text)
+            return "\n\n".join(pages)
+        except Exception:
+            return ""
+
+    # Word .docx
+    if name.endswith(".docx"):
+        try:
+            import docx  # python-docx
+
+            doc = docx.Document(io.BytesIO(data))
+            return "\n".join(p.text for p in doc.paragraphs)
+        except Exception:
+            return ""
+
+    # Fallback: try decode as text
+    try:
+        return data.decode("utf-8", errors="ignore")
+    except Exception:
+        return ""
 
 
-# ---------------------- UI ---------------------- #
+def call_summarization_api(text: str, email: Optional[str] = None) -> str:
+    """Call the backend /summarize endpoint and return the summary text."""
+    try:
+        payload = {"text": text}
+        if email:
+            payload["email"] = email
 
-st.title("Upload Data & Generate a Client-Ready Summary")
+        response = requests.post(f"{BACKEND_URL}/summarize", json=payload, timeout=60)
+        response.raise_for_status()
+        data = response.json()
+        return data.get("summary", "").strip()
+    except Exception as exc:
+        st.error(f"Summarization failed. Details: {exc}")
+        return ""
 
-st.subheader("Your email")
-st.caption("Use the same email address you used (or will use) on the Billing page.")
-email = st.text_input("Email", placeholder="you@example.com")
 
-status_info = get_subscription_status(email) if email else {"plan": "free", "active": False}
-plan = status_info.get("plan", "free")
-active = status_info.get("active", False)
+# ---------- Page UI ----------
 
-status_label = f"{plan.capitalize()} (active)" if active else "Free"
-st.write(f"**Status:** {status_label}")
+st.title("Upload Data & Generate a Business-Friendly Summary")
 
-if not active:
-    st.info(
-        "You’re currently on the **Free** tier. Summaries may be shorter and input size "
-        "may be limited. Upgrade on the **Billing** page for higher limits and richer summaries."
+# Query params (e.g. after returning from Stripe)
+params = st.query_params
+status = params.get("status")
+
+if status == "success":
+    st.success(
+        "Your subscription was completed successfully. "
+        "You can now continue using AI Report with your selected plan."
     )
+elif status == "cancelled":
+    st.info("Checkout was cancelled. You can try again from the Billing page at any time.")
+
+st.markdown("### Your email")
+st.caption("Use the same email you used when subscribing so we can keep things linked.")
+
+default_email = st.session_state.get("user_email", "")
+email = st.text_input("Email address", value=default_email, key="upload_email")
+
+if email:
+    st.session_state["user_email"] = email
+
+# You can optionally wire this to a real plan/status endpoint later
+st.markdown("### Status")
+st.info(
+    "You’re currently using AI Report. Plan-specific limits can be enforced later via the backend, "
+    "but you can already upload and summarize documents."
+)
 
 st.markdown("---")
 
-# ---------------------- STEP 1: ADD CONTENT ---------------------- #
+st.markdown("## 1. Add your content")
 
-st.subheader("1. Add your content")
-st.caption(
-    "Upload reports, meeting notes, proposals, research, or any long-form document you "
-    "want turned into a clear summary for clients or stakeholders."
-)
-
-left, right = st.columns([1.4, 1])
+left, right = st.columns(2)
 
 with left:
-    st.write("**Upload documents**")
-    uploaded_file = st.file_uploader(
-        "Drag and drop a file here",
-        type=["txt", "md", "pdf", "csv"],
-        help="Supported formats: TXT, MD, PDF, CSV (up to 200MB per file).",
-    )
+    st.markdown("#### Upload a file")
+    st.caption("Supported formats: TXT, MD, PDF, DOCX, CSV (max 200MB per file).")
 
-with right:
-    st.write("**…or paste text manually**")
-    pasted_text = st.text_area(
-        "Paste any text you want summarized:",
-        height=220,
-        placeholder="Paste email threads, call notes, draft documents, or research here…",
+    uploaded_file = st.file_uploader(
+        "Drag and drop a file here, or click **Browse files**.",
+        type=["txt", "md", "markdown", "pdf", "docx", "csv"],
         label_visibility="collapsed",
     )
 
-# Decide which text to use
-text_from_file = extract_text_from_file(uploaded_file) if uploaded_file else ""
-final_text = pasted_text.strip() or text_from_file.strip()
+with right:
+    st.markdown("#### Or paste text manually")
+    manual_text = st.text_area(
+        "Paste meeting notes, reports, or any free-text content.",
+        height=260,
+    )
 
-char_count = len(final_text)
-if char_count:
-    st.caption(f"Detected about **{char_count:,}** characters of input.")
+source_text = ""
+
+if uploaded_file is not None:
+    source_text = extract_text_from_file(uploaded_file)
+elif manual_text.strip():
+    source_text = manual_text.strip()
+
+if source_text:
+    st.markdown("---")
+    st.markdown("### 2. Generate a summary")
+
+    char_count = len(source_text)
+    st.caption(f"Detected **{char_count:,}** characters in your input.")
+
+    if st.button("Generate Business Summary", type="primary"):
+        with st.spinner("Analyzing your document and creating a summary..."):
+            summary = call_summarization_api(source_text, email=email)
+
+        st.markdown("### Summary for your client or audience")
+        if summary:
+            st.write(summary)
+        else:
+            st.warning(
+                "No summary was returned. You may want to try with a shorter input or check your API configuration."
+            )
 else:
-    st.caption("No content detected yet. Upload a file or paste text to continue.")
+    st.info("Upload a file or paste text on the right to get started.")
 
 st.markdown("---")
 
-# ---------------------- STEP 2: GENERATE SUMMARY ---------------------- #
+st.markdown(
+    """
+### What this tool does for you
 
-st.subheader("2. Generate a summary")
-
-generate_button = st.button("Generate Client-Ready Summary", type="primary", disabled=not final_text or not email)
-
-if not email:
-    st.warning("Enter your email before generating a summary.", icon="⚠️")
-
-if generate_button and final_text and email:
-    with st.spinner("Generating summary…"):
-        result = summarize(email=email, text=final_text)
-
-    if "error" in result:
-        st.error(f"Summary generation failed: {result['error']}")
-    else:
-        summary_text = result.get("summary", "").strip()
-
-        st.subheader("Summary for your client or audience")
-        st.caption(
-            "Use this in emails, reports, slide decks, or internal updates. "
-            "It’s written for non-technical readers."
-        )
-
-        if summary_text:
-            st.write(summary_text)
-        else:
-            st.warning("No summary was returned by the backend. Try adjusting the input text.")
+- **Saves time** – Turn dense reports and notes into short, readable summaries  
+- **Improves clarity** – Highlight key points, risks, decisions, and next steps  
+- **Helps communication** – Quickly share updates with clients, managers, or your team  
+"""
+)

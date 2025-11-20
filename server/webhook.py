@@ -1,256 +1,197 @@
+import json
+import logging
 import os
-import sqlite3
-from typing import Optional
 
-from fastapi import FastAPI, HTTPException, Request
-from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
 import stripe
+from fastapi import FastAPI, Header, HTTPException, Request
+from fastapi.middleware.cors import CORSMiddleware
 from openai import OpenAI
+from pydantic import BaseModel
 
-# ------------- ENV / CONFIG ------------ #
+# ---------- Logging ----------
 
-stripe.api_key = os.getenv("STRIPE_SECRET_KEY")
-WEBHOOK_SECRET = os.getenv("STRIPE_WEBHOOK_SECRET", "")
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
-PRICE_BASIC = os.getenv("PRICE_BASIC")
-PRICE_PRO = os.getenv("PRICE_PRO")
-PRICE_ENTERPRISE = os.getenv("PRICE_ENTERPRISE")
+# ---------- Environment ----------
 
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+STRIPE_SECRET_KEY = os.environ.get("STRIPE_SECRET_KEY")
+if not STRIPE_SECRET_KEY:
+    raise RuntimeError("STRIPE_SECRET_KEY is not set")
 
-client = OpenAI(api_key=OPENAI_API_KEY)
+stripe.api_key = STRIPE_SECRET_KEY
 
-DB_PATH = os.getenv("SUBSCRIPTION_DB_PATH", "subscriptions.db")
+STRIPE_WEBHOOK_SECRET = os.getenv("STRIPE_WEBHOOK_SECRET")
 
-PLAN_BY_PRICE = {
-    PRICE_BASIC: "basic",
-    PRICE_PRO: "pro",
-    PRICE_ENTERPRISE: "enterprise",
+PRICE_BASIC = os.environ.get("PRICE_BASIC")
+PRICE_PRO = os.environ.get("PRICE_PRO")
+PRICE_ENTERPRISE = os.environ.get("PRICE_ENTERPRISE")
+
+SUCCESS_URL = os.environ.get("SUCCESS_URL")  # e.g. https://your-app.onrender.com/Billing
+CANCEL_URL = os.environ.get("CANCEL_URL", SUCCESS_URL or "")
+
+if not all([PRICE_BASIC, PRICE_PRO, PRICE_ENTERPRISE]):
+    logger.warning("One or more Stripe price IDs (PRICE_BASIC/PRO/ENTERPRISE) are not set.")
+
+PLAN_TO_PRICE = {
+    "basic": PRICE_BASIC,
+    "pro": PRICE_PRO,
+    "enterprise": PRICE_ENTERPRISE,
 }
 
-# ------------- DB SETUP ------------ #
+OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
 
+client = OpenAI()
 
-def init_db():
-    conn = sqlite3.connect(DB_PATH)
-    cur = conn.cursor()
-    cur.execute(
-        """
-        CREATE TABLE IF NOT EXISTS subscriptions (
-            email TEXT PRIMARY KEY,
-            plan TEXT NOT NULL,
-            status TEXT NOT NULL
-        )
-        """
-    )
-    conn.commit()
-    conn.close()
-
-
-def upsert_subscription(email: str, plan: str, status: str):
-    conn = sqlite3.connect(DB_PATH)
-    cur = conn.cursor()
-    cur.execute(
-        """
-        INSERT INTO subscriptions(email, plan, status)
-        VALUES (?, ?, ?)
-        ON CONFLICT(email) DO UPDATE SET
-            plan=excluded.plan,
-            status=excluded.status
-        """,
-        (email, plan, status),
-    )
-    conn.commit()
-    conn.close()
-
-
-def get_subscription(email: str) -> Optional[dict]:
-    conn = sqlite3.connect(DB_PATH)
-    cur = conn.cursor()
-    cur.execute("SELECT email, plan, status FROM subscriptions WHERE email = ?", (email,))
-    row = cur.fetchone()
-    conn.close()
-    if not row:
-        return None
-    return {"email": row[0], "plan": row[1], "status": row[2]}
-
-
-init_db()
-
-# ------------- FASTAPI APP ------------ #
+# ---------- FastAPI app ----------
 
 app = FastAPI(title="AI Report Backend")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # tighten later if you want
+    allow_origins=["*"],  # you can tighten this to your frontend URL if you like
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-
-# ------------- MODELS ------------ #
-
-class CheckoutRequest(BaseModel):
-    email: str
-    plan: str  # 'basic' | 'pro' | 'enterprise'
+# ---------- Pydantic models ----------
 
 
 class SummarizeRequest(BaseModel):
-    email: str
     text: str
+    email: str | None = None
 
 
-# ------------- ROUTES ------------ #
+class SummarizeResponse(BaseModel):
+    summary: str
+
+
+class CheckoutRequest(BaseModel):
+    email: str
+    plan: str  # "basic", "pro", "enterprise"
+
+
+class CheckoutResponse(BaseModel):
+    checkout_url: str
+
+
+# ---------- Routes ----------
+
 
 @app.get("/health")
-def health():
-    return {"ok": True}
+async def health():
+    return {"status": "ok"}
 
 
-@app.get("/subscription-status")
-def subscription_status(email: str):
-    """
-    Return subscription info for a given email.
-    If none found, treat as free.
-    """
-    sub = get_subscription(email)
-    if not sub:
-        return {"email": email, "plan": "free", "active": False}
-
-    active = sub["status"] == "active"
-    return {"email": email, "plan": sub["plan"], "active": active}
-
-
-@app.post("/create-checkout-session")
-def create_checkout_session(payload: CheckoutRequest):
-    if not stripe.api_key:
-        raise HTTPException(status_code=500, detail="Stripe is not configured.")
-
-    plan = payload.plan.lower()
-    price_id = None
-
-    if plan == "basic":
-        price_id = PRICE_BASIC
-    elif plan == "pro":
-        price_id = PRICE_PRO
-    elif plan == "enterprise":
-        price_id = PRICE_ENTERPRISE
-
-    if not price_id:
-        raise HTTPException(status_code=400, detail="Invalid plan selected.")
-
-    try:
-      session = stripe.checkout.Session.create(
-    mode="subscription",
-    success_url=SUCCESS_URL,
-    cancel_url=CANCEL_URL,
-    customer_email=data.email,
-    line_items=[{"price": data.price_id, "quantity": 1}],
-    allow_promotion_codes=True,  # 🔹 this makes the coupon / promo box appear
+BUSINESS_SYSTEM_PROMPT = (
+    "You are an AI assistant that summarizes business documents for non-technical readers. "
+    "Your audience might be clients, managers, or stakeholders who need a clear, concise view "
+    "of the key points. Focus on:\n"
+    "- Main objectives and context\n"
+    "- Key insights, decisions, or results\n"
+    "- Risks, issues, or concerns (if any)\n"
+    "- Recommended next steps or actions\n\n"
+    "Write in clear, professional language. Avoid jargon where possible, and keep the tone "
+    "neutral and business-friendly."
 )
 
 
-    except Exception as exc:
-        raise HTTPException(status_code=500, detail=str(exc))
-
-    return {"checkout_url": session.url}
-
-
-@app.post("/webhook")
-async def stripe_webhook(request: Request):
-    """
-    Stripe webhook to mark subscriptions as active/cancelled.
-    """
-    if not WEBHOOK_SECRET:
-        # If you haven't configured the secret, ignore verification
-        payload = await request.body()
-        event = stripe.Event.construct_from(request.json(), stripe.api_key)
-    else:
-        payload = await request.body()
-        sig_header = request.headers.get("stripe-signature", "")
-        try:
-            event = stripe.Webhook.construct_event(
-                payload=payload, sig_header=sig_header, secret=WEBHOOK_SECRET
-            )
-        except Exception as exc:
-            raise HTTPException(status_code=400, detail=str(exc))
-
-    event_type = event["type"]
-    data = event["data"]["object"]
-
-    email = data.get("customer_email") or data.get("customer_details", {}).get("email")
-    status = None
-    plan = None
-
-    if event_type == "checkout.session.completed":
-        # Subscription will be created; treat as active once checkout completes.
-        price_id = None
-        if data.get("subscription"):
-            sub = stripe.Subscription.retrieve(data["subscription"])
-            if sub["items"]["data"]:
-                price_id = sub["items"]["data"][0]["price"]["id"]
-        elif data.get("line_items"):
-            # Optional fallback
-            pass
-
-        plan = PLAN_BY_PRICE.get(price_id, "basic")
-        status = "active"
-
-    elif event_type in ("customer.subscription.deleted", "customer.subscription.canceled"):
-        # Mark as inactive
-        price_id = data["items"]["data"][0]["price"]["id"]
-        plan = PLAN_BY_PRICE.get(price_id, "basic")
-        status = "canceled"
-
-    if email and plan and status:
-        upsert_subscription(email=email, plan=plan, status=status)
-
-    return {"received": True}
-
-
-# ------------- SUMMARIZATION ------------ #
-
-SYSTEM_PROMPT = """
-You are an expert business communicator.
-
-A user will send you long, sometimes messy text: reports, emails, meeting notes,
-technical documentation, or research.
-
-Your job is to:
-- Extract the key points and explain them in clear, simple language.
-- Focus on what a non-technical client, manager, or business stakeholder needs to know.
-- Highlight important decisions, risks, and next steps.
-- Avoid medical or clinical framing. This is general business content.
-
-Write the summary in short paragraphs and bullet points, using a neutral, professional tone.
-Do not invent facts that are not supported by the input.
-"""
-
-
-@app.post("/summarize")
-def summarize(payload: SummarizeRequest):
-    if not OPENAI_API_KEY:
-        raise HTTPException(status_code=500, detail="OpenAI API key is not configured.")
-
-    text = payload.text.strip()
+@app.post("/summarize", response_model=SummarizeResponse)
+async def summarize(body: SummarizeRequest):
+    text = body.text.strip()
     if not text:
-        raise HTTPException(status_code=400, detail="No text provided for summarization.")
+        raise HTTPException(status_code=400, detail="Text is empty")
 
     try:
         completion = client.chat.completions.create(
-            model=os.getenv("OPENAI_MODEL", "gpt-4.1-mini"),
+            model=OPENAI_MODEL,
             messages=[
-                {"role": "system", "content": SYSTEM_PROMPT},
+                {"role": "system", "content": BUSINESS_SYSTEM_PROMPT},
                 {"role": "user", "content": text},
             ],
-            temperature=0.2,
+            temperature=0.3,
+            max_tokens=800,
         )
+
         summary = completion.choices[0].message.content.strip()
+        return SummarizeResponse(summary=summary)
     except Exception as exc:
+        logger.exception("Error during OpenAI summarization")
         raise HTTPException(status_code=500, detail=str(exc))
 
-    return {"summary": summary}
 
+@app.post("/create-checkout-session", response_model=CheckoutResponse)
+async def create_checkout_session(body: CheckoutRequest):
+    plan = body.plan.lower()
+    price_id = PLAN_TO_PRICE.get(plan)
+
+    if not price_id:
+        raise HTTPException(status_code=400, detail=f"Unknown plan: {body.plan}")
+
+    if not SUCCESS_URL:
+        raise HTTPException(
+            status_code=500,
+            detail="SUCCESS_URL is not configured in the backend environment.",
+        )
+
+    try:
+        # Stripe Checkout for subscriptions
+        session = stripe.checkout.Session.create(
+            mode="subscription",
+            customer_email=body.email,
+            line_items=[
+                {
+                    "price": price_id,
+                    "quantity": 1,
+                }
+            ],
+            # These URLs control where Stripe sends the user after checkout
+            success_url=f"{SUCCESS_URL}?status=success&session_id={{CHECKOUT_SESSION_ID}}",
+            cancel_url=f"{CANCEL_URL}?status=cancelled" if CANCEL_URL else SUCCESS_URL,
+            allow_promotion_codes=True,  # enables coupon / promo code field
+            billing_address_collection="auto",
+        )
+
+        logger.info("Created checkout session %s for %s (%s)", session.id, body.email, plan)
+        return CheckoutResponse(checkout_url=session.url)
+    except Exception as exc:
+        logger.exception("Error creating Stripe Checkout session")
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+@app.post("/webhook")
+async def stripe_webhook(
+    request: Request,
+    stripe_signature: str | None = Header(default=None, alias="Stripe-Signature"),
+):
+    """
+    Basic Stripe webhook handler.
+    Right now this just verifies the signature (if configured) and logs the event.
+    You can extend this later to store subscription status in a database.
+    """
+    payload = await request.body()
+
+    try:
+        if STRIPE_WEBHOOK_SECRET and stripe_signature:
+            event = stripe.Webhook.construct_event(
+                payload=payload,
+                sig_header=stripe_signature,
+                secret=STRIPE_WEBHOOK_SECRET,
+            )
+        else:
+            # No verification – for local testing only
+            event = json.loads(payload.decode("utf-8"))
+    except Exception as exc:
+        logger.exception("Failed to parse Stripe webhook")
+        raise HTTPException(status_code=400, detail=f"Webhook error: {exc}")
+
+    event_type = event.get("type")
+    logger.info("Received Stripe event: %s", event_type)
+
+    # Example places to extend logic:
+    # - checkout.session.completed
+    # - customer.subscription.updated
+    # - customer.subscription.deleted
+
+    return {"received": True}
