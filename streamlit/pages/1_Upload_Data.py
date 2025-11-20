@@ -1,183 +1,232 @@
 import os
 import io
+from typing import Optional
+
 import requests
 import streamlit as st
 
-from typing import Optional
+# Optional PDF support – comment out if you don't have PyPDF2 installed
+try:
+    from PyPDF2 import PdfReader
+except Exception:  # pragma: no cover
+    PdfReader = None
 
-# Must be first Streamlit call
+# ---------------------------
+# Page config
+# ---------------------------
 st.set_page_config(
     page_title="Upload Data – AI Report",
     page_icon="📄",
     layout="wide",
 )
 
-BACKEND_URL = os.getenv("BACKEND_URL", "http://localhost:8000").rstrip("/")
+# ---------------------------
+# Helpers
+# ---------------------------
 
-# ---------- Helpers ----------
+def get_backend_url() -> Optional[str]:
+    """
+    Read the backend URL from the Streamlit environment.
+    On Render you have BACKEND_URL defined in the ai-report-saas service.
+    """
+    return os.getenv("BACKEND_URL")
 
 
-def extract_text_from_file(uploaded_file) -> str:
-    """Convert an uploaded file into plain text."""
-    if uploaded_file is None:
+def read_file_to_text(upload) -> str:
+    """
+    Convert the uploaded file into plain text for the summarizer.
+    Supports txt / md / markdown / pdf / docx / csv (best-effort).
+    """
+    if upload is None:
         return ""
 
-    name = uploaded_file.name.lower()
-    data = uploaded_file.read()
+    name = upload.name.lower()
 
-    # Make sure we can read it more than once
-    if hasattr(uploaded_file, "seek"):
-        uploaded_file.seek(0)
+    # Read bytes once
+    raw = upload.read()
 
-    # Simple text formats
-    if name.endswith((".txt", ".md", ".markdown")):
-        return data.decode("utf-8", errors="ignore")
-
-    # CSV -> treat as text table
-    if name.endswith(".csv"):
+    # Text-like formats
+    if name.endswith((".txt", ".md", ".markdown", ".csv")):
         try:
-            return data.decode("utf-8", errors="ignore")
+            return raw.decode("utf-8", errors="ignore")
         except Exception:
-            return ""
+            return raw.decode("latin-1", errors="ignore")
 
-    # PDF
-    if name.endswith(".pdf"):
-        try:
-            from PyPDF2 import PdfReader
-
-            reader = PdfReader(io.BytesIO(data))
-            pages = []
-            for page in reader.pages:
-                text = page.extract_text() or ""
-                pages.append(text)
-            return "\n\n".join(pages)
-        except Exception:
-            return ""
-
-    # Word .docx
+    # Simple DOCX support (best effort, no extra dependency)
     if name.endswith(".docx"):
         try:
-            import docx  # python-docx
+            import zipfile
+            from xml.etree import ElementTree
 
-            doc = docx.Document(io.BytesIO(data))
-            return "\n".join(p.text for p in doc.paragraphs)
+            with zipfile.ZipFile(io.BytesIO(raw)) as z:
+                with z.open("word/document.xml") as doc_xml:
+                    tree = ElementTree.parse(doc_xml)
+                    root = tree.getroot()
+                    # DOCX text nodes are in <w:t> tags
+                    ns = {"w": "http://schemas.openxmlformats.org/wordprocessingml/2006/main"}
+                    texts = [node.text for node in root.findall(".//w:t", ns) if node.text]
+                    return "\n".join(texts)
         except Exception:
-            return ""
+            # Fallback to naive decode
+            return raw.decode("utf-8", errors="ignore")
 
-    # Fallback: try decode as text
-    try:
-        return data.decode("utf-8", errors="ignore")
-    except Exception:
-        return ""
+    # PDF using PyPDF2 if available
+    if name.endswith(".pdf") and PdfReader is not None:
+        try:
+            reader = PdfReader(io.BytesIO(raw))
+            pages = [page.extract_text() or "" for page in reader.pages]
+            return "\n\n".join(pages)
+        except Exception:
+            # Fallback to raw bytes if extraction fails
+            return raw.decode("utf-8", errors="ignore")
 
-
-def call_summarization_api(text: str, email: Optional[str] = None) -> str:
-    """Call the backend /summarize endpoint and return the summary text."""
-    try:
-        payload = {"text": text}
-        if email:
-            payload["email"] = email
-
-        response = requests.post(f"{BACKEND_URL}/summarize", json=payload, timeout=60)
-        response.raise_for_status()
-        data = response.json()
-        return data.get("summary", "").strip()
-    except Exception as exc:
-        st.error(f"Summarization failed. Details: {exc}")
-        return ""
+    # Last resort: dump bytes as text
+    return raw.decode("utf-8", errors="ignore")
 
 
-# ---------- Page UI ----------
+def summarize_via_backend(text: str, email: str, plan: str = "free") -> str:
+    """
+    Call the FastAPI backend /summarize endpoint.
+    """
+    backend = get_backend_url()
+    if not backend:
+        raise RuntimeError("BACKEND_URL is not configured in the Streamlit environment.")
+
+    url = backend.rstrip("/") + "/summarize"
+
+    payload = {
+        "email": email or "anonymous@example.com",
+        "plan": plan,
+        "text": text,
+    }
+
+    resp = requests.post(url, json=payload, timeout=60)
+    resp.raise_for_status()
+    data = resp.json()
+
+    # Expecting {"summary": "..."} from the backend
+    return data.get("summary", "").strip()
+
+
+# ---------------------------
+# UI
+# ---------------------------
 
 st.title("Upload Data & Generate a Business-Friendly Summary")
 
-# Query params (e.g. after returning from Stripe)
-params = st.query_params
-status = params.get("status")
+st.write(
+    "Turn dense reports, meeting notes, and long documents into a clear, client-ready summary "
+    "you can drop into emails, slide decks, or status updates."
+)
 
-if status == "success":
-    st.success(
-        "Your subscription was completed successfully. "
-        "You can now continue using AI Report with your selected plan."
-    )
-elif status == "cancelled":
-    st.info("Checkout was cancelled. You can try again from the Billing page at any time.")
-
-st.markdown("### Your email")
-st.caption("Use the same email you used when subscribing so we can keep things linked.")
+# Email (used to link subscription + summaries)
+st.subheader("Your email")
+st.caption("Use the same email address you subscribed with on the Billing page.")
 
 default_email = st.session_state.get("user_email", "")
-email = st.text_input("Email address", value=default_email, key="upload_email")
+email = st.text_input("Email address", value=default_email, placeholder="you@example.com")
 
-if email:
+if email and email != default_email:
     st.session_state["user_email"] = email
 
-# You can optionally wire this to a real plan/status endpoint later
-st.markdown("### Status")
-st.info(
-    "You’re currently using AI Report. Plan-specific limits can be enforced later via the backend, "
-    "but you can already upload and summarize documents."
+# Plan / status banner (purely informational; backend can still enforce limits)
+plan = st.session_state.get("subscription_plan", "Free").capitalize()
+st.markdown(
+    f"**Status:** {plan} plan  \n"
+    "Upload limits and summary depth may vary based on your current subscription."
 )
 
 st.markdown("---")
 
-st.markdown("## 1. Add your content")
+# ---------------------------
+# 1. Add content
+# ---------------------------
+st.header("1. Add your content")
 
-left, right = st.columns(2)
+col_left, col_right = st.columns(2)
 
-with left:
-    st.markdown("#### Upload a file")
-    st.caption("Supported formats: TXT, MD, PDF, DOCX, CSV (max 200MB per file).")
+with col_left:
+    st.subheader("Upload a file")
+    st.caption("Supported formats: TXT, MD, MARKDOWN, PDF, DOCX, CSV (max 200MB per file).")
 
     uploaded_file = st.file_uploader(
-        "Drag and drop a file here, or click **Browse files**.",
+        "Drag and drop file here",
         type=["txt", "md", "markdown", "pdf", "docx", "csv"],
-        label_visibility="collapsed",
+        help="Upload the report, meeting notes, or document you want summarized.",
     )
 
-with right:
-    st.markdown("#### Or paste text manually")
+with col_right:
+    st.subheader("Or paste text manually")
     manual_text = st.text_area(
         "Paste meeting notes, reports, or any free-text content.",
         height=260,
+        placeholder="Paste your report or notes here if you prefer not to upload a file...",
     )
 
-source_text = ""
-
-if uploaded_file is not None:
-    source_text = extract_text_from_file(uploaded_file)
-elif manual_text.strip():
-    source_text = manual_text.strip()
-
-if source_text:
-    st.markdown("---")
-    st.markdown("### 2. Generate a summary")
-
-    char_count = len(source_text)
-    st.caption(f"Detected **{char_count:,}** characters in your input.")
-
-    if st.button("Generate Business Summary", type="primary"):
-        with st.spinner("Analyzing your document and creating a summary..."):
-            summary = call_summarization_api(source_text, email=email)
-
-        st.markdown("### Summary for your client or audience")
-        if summary:
-            st.write(summary)
-        else:
-            st.warning(
-                "No summary was returned. You may want to try with a shorter input or check your API configuration."
-            )
-else:
-    st.info("Upload a file or paste text on the right to get started.")
+st.info("Upload a file or paste text on the right to get started.")
 
 st.markdown("---")
 
+# ---------------------------
+# 2. Generate summary
+# ---------------------------
+st.header("2. Generate a summary")
+
+# Decide which source we're using
+source_text = ""
+source_label = ""
+
+if uploaded_file is not None:
+    source_text = read_file_to_text(uploaded_file)
+    source_label = f"file **{uploaded_file.name}**"
+elif manual_text.strip():
+    source_text = manual_text.strip()
+    source_label = "pasted text"
+
+if source_text:
+    detected_chars = len(source_text)
+    st.caption(f"Detected ~{detected_chars:,} characters in your {source_label}.")
+else:
+    st.caption("No content detected yet – upload a file or paste some text above.")
+
+generate_clicked = st.button("Generate Business Summary", type="primary")
+
+summary_placeholder = st.empty()
+
+if generate_clicked:
+    if not source_text:
+        st.warning("Please upload a file or paste some text before generating a summary.")
+    elif not email:
+        st.warning("Please enter your email address so we can link your summaries to your subscription.")
+    else:
+        with st.spinner("Generating your business-friendly summary…"):
+            try:
+                summary = summarize_via_backend(source_text, email=email, plan=plan.lower())
+                if summary:
+                    st.success("Summary generated successfully.")
+                    summary_placeholder.markdown(
+                        "### Summary for your client or audience\n\n" + summary
+                    )
+                else:
+                    st.warning(
+                        "No summary was returned. You may want to try with a shorter input "
+                        "or check your API configuration."
+                    )
+            except requests.exceptions.RequestException as e:
+                st.error(
+                    f"Summarization failed. Details: {type(e).__name__}: {e}"
+                )
+            except Exception as e:
+                st.error(f"Unexpected error while summarizing: {e}")
+
+st.markdown("---")
+
+st.header("What this tool does for you")
+
 st.markdown(
     """
-### What this tool does for you
-
-- **Saves time** – Turn dense reports and notes into short, readable summaries  
-- **Improves clarity** – Highlight key points, risks, decisions, and next steps  
-- **Helps communication** – Quickly share updates with clients, managers, or your team  
+- **Saves time** – Turn dense reports and notes into short, readable summaries.
+- **Improves clarity** – Highlight key points, risks, decisions, and next steps.
+- **Helps communication** – Quickly share updates with clients, managers, or your team.
 """
 )
