@@ -10,4 +10,3 @@ openai>=1.0.0
 SQLAlchemy>=2.0
 email-validator
 pydantic
-psycopg2-binary==2.9.9
