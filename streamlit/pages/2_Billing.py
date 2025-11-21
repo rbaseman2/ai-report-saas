@@ -2,159 +2,219 @@ import os
 import requests
 import streamlit as st
 
-# -------------------------------------------------------------------
-# Page config (must be first Streamlit call)
-# -------------------------------------------------------------------
 st.set_page_config(
     page_title="Billing & Plans – AI Report",
     page_icon="💳",
     layout="wide",
 )
 
-# Backend URL – set in Render as BACKEND_URL (falls back to localhost for dev)
-BACKEND_URL = os.getenv("BACKEND_URL", "http://localhost:8000").rstrip("/")
+BACKEND_URL = os.getenv("BACKEND_URL", "http://localhost:8000")
 
-st.title("Billing & Plans")
-st.caption(
-    "Use this page to manage your subscription and upgrade your document summary limits."
-)
+PLAN_CONFIG = {
+    "basic": {
+        "name": "Basic",
+        "price": "$9.99 / month",
+        "description": [
+            "Upload up to **5 documents per month**",
+            "Clear AI-generated summaries for clients and stakeholders",
+            "Copy-paste summaries into emails, reports, and slide decks",
+        ],
+    },
+    "pro": {
+        "name": "Pro",
+        "price": "$19.99 / month",
+        "description": [
+            "Upload up to **30 documents per month**",
+            "Deeper, more structured summaries (key points, risks, and action items)",
+            "Priority email support",
+        ],
+    },
+    "enterprise": {
+        "name": "Enterprise",
+        "price": "$39.99 / month",
+        "description": [
+            "**Unlimited uploads** for your team",
+            "Team accounts and shared templates",
+            "Premium support & integration help",
+        ],
+    },
+}
 
-# Optional: show which backend we're talking to (helps when debugging)
-st.caption(f"Using backend: {BACKEND_URL}")
 
-# -------------------------------------------------------------------
-# Query params (e.g. after redirect back from Stripe)
-# -------------------------------------------------------------------
-qp = st.query_params
-status = qp.get("status")
-# st.query_params values are lists; normalize to a single string
-if isinstance(status, list):
-    status = status[0]
+def get_backend_url() -> str:
+    return BACKEND_URL.rstrip("/")
 
-if status == "success":
-    st.success("Your subscription was completed successfully.")
-elif status == "cancelled":
-    st.info("Checkout cancelled. You can start again at any time.")
-elif status == "error":
-    st.error("There was a problem with checkout. Please try again or contact support.")
 
-st.markdown("---")
-
-# -------------------------------------------------------------------
-# Email capture
-# -------------------------------------------------------------------
-st.markdown("### Your email")
-st.caption(
-    "We use this email to link your subscription, upload limits, and summaries. "
-    "Use the same address you enter on the Stripe checkout page."
-)
-
-default_email = st.session_state.get("user_email", "")
-email = st.text_input("Email address", value=default_email or "", key="billing_email")
-
-if st.button("Save email"):
+def get_subscription(email: str) -> dict:
     if not email:
-        st.warning("Please enter an email address first.")
-    else:
-        st.session_state["user_email"] = email
-        st.success("Email saved. You can now choose a plan below to continue to checkout.")
-
-st.markdown("---")
-
-# -------------------------------------------------------------------
-# Helper: start checkout via backend
-# -------------------------------------------------------------------
-def start_checkout(plan: str) -> None:
-    """
-    Call the FastAPI backend to create a Stripe Checkout Session
-    and return a link the user can click.
-
-    plan: "basic" | "pro" | "enterprise"
-    """
-    if not email:
-        st.warning("Please enter and save your email before choosing a plan.")
-        return
-
-    payload = {"email": email, "plan": plan}
+        return {"plan": "free"}
 
     try:
-        with st.spinner("Contacting secure payment server…"):
-            resp = requests.post(
-                f"{BACKEND_URL}/create-checkout-session",
-                json=payload,
-                timeout=60,  # give Render time to wake the backend
+        resp = requests.get(
+            f"{get_backend_url()}/subscription/status",
+            params={"email": email},
+            timeout=10,
+        )
+        if resp.ok:
+            data = resp.json()
+            if "plan" not in data:
+                data["plan"] = "free"
+            return data
+    except Exception:
+        pass
+
+    return {"plan": "free"}
+
+
+def create_checkout_session(email: str, plan_id: str) -> str | None:
+    """
+    Ask the backend to create a Stripe Checkout session and return the URL.
+    """
+    try:
+        resp = requests.post(
+            f"{get_backend_url()}/create-checkout-session",
+            json={"email": email, "price_id": plan_id},
+            timeout=30,
+        )
+        if resp.ok:
+            data = resp.json()
+            return data.get("checkout_url")
+        else:
+            st.error(
+                f"Checkout failed: {resp.status_code} {resp.reason} "
+                f"for url: {resp.url}"
             )
-        resp.raise_for_status()
-        data = resp.json()
-        checkout_url = data.get("checkout_url")
+    except Exception as e:
+        st.error(f"Checkout failed: {e}")
+    return None
 
-        if not checkout_url:
-            st.error("Backend did not return a checkout URL. Please try again in a moment.")
-            return
 
-        st.success("Checkout created. Click below to continue securely on Stripe:")
-        st.markdown(
-            f"[➡️ Open secure checkout]({checkout_url})",
-            unsafe_allow_html=False,
-        )
+# ---------------------------------------------------------------------
+# Page layout
+# ---------------------------------------------------------------------
 
-    except requests.exceptions.Timeout:
-        st.error(
-            "The request to the payment server timed out. "
-            "If your backend was asleep, please wait a few seconds and try again."
-        )
-    except Exception as exc:
-        st.error(f"Checkout failed: {exc}")
-
-# -------------------------------------------------------------------
-# Plan cards
-# -------------------------------------------------------------------
-st.markdown("### Plans")
-
-col_basic, col_pro, col_ent = st.columns(3)
-
-with col_basic:
-    st.subheader("Basic")
-    st.caption("$9.99 / month")
-    st.markdown(
-        """
-- Upload up to **5 documents per month**  
-- Clear AI-generated summaries for clients and stakeholders  
-- Copy-paste summaries into emails, reports, and slide decks  
-        """
-    )
-    if st.button("Choose Basic"):
-        start_checkout("basic")
-
-with col_pro:
-    st.subheader("Pro")
-    st.caption("$19.99 / month")
-    st.markdown(
-        """
-- Upload up to **30 documents per month**  
-- Deeper, more structured summaries (key points, risks, and action items)  
-- Priority email support  
-        """
-    )
-    if st.button("Choose Pro"):
-        start_checkout("pro")
-
-with col_ent:
-    st.subheader("Enterprise")
-    st.caption("$39.99 / month")
-    st.markdown(
-        """
-- **Unlimited uploads** for your team  
-- Team accounts and shared templates  
-- Premium support & integration help  
-        """
-    )
-    if st.button("Choose Enterprise"):
-        start_checkout("enterprise")
-
-st.markdown("---")
+st.title("Billing & Plans")
 
 st.caption(
-    "After a successful checkout, your plan will be updated automatically and your upload "
-    "limits will adjust on the **Upload Data** page (once enforced in the backend)."
+    "Use this page to manage your subscription and upgrade your document limits."
 )
+
+# Query params (e.g. Stripe redirect with ?status=success)
+qp = st.query_params
+status_param = qp.get("status", [None])[0] if qp else None
+
+if status_param == "success":
+    st.success(
+        "✅ Your payment was successful and your subscription is now active. "
+        "You can go to the **Upload Data** page to start generating summaries."
+    )
+    st.markdown("[Go to Upload Data →](/Upload_Data)")
+elif status_param == "cancel":
+    st.info(
+        "You cancelled checkout. You can choose a plan again below whenever you’re ready."
+    )
+
+st.divider()
+
+# ----------------------------- STEP 1: EMAIL -------------------------
+
+st.markdown("### Step 1 – Add your email")
+
+default_email = st.session_state.get("user_email", "")
+email = st.text_input(
+    "Email address",
+    value=default_email,
+    placeholder="you@example.com",
+    help="We use this to link your subscription, upload limits, and summaries.",
+)
+
+col_email_btn, col_email_msg = st.columns([0.25, 0.75])
+
+with col_email_btn:
+    save_clicked = st.button("Save email", type="primary")
+
+if save_clicked:
+    if not email:
+        st.error("Please enter an email address first.")
+    else:
+        st.session_state["user_email"] = email
+        with col_email_msg:
+            st.success(
+                "Email saved. **Next: choose a plan below (Step 2)** to open secure "
+                "checkout. After payment, you’ll be returned here and can continue "
+                "on to **Upload Data (Step 3)**."
+            )
+
+# Always show current plan info if we have an email
+subscription = get_subscription(email)
+current_plan = subscription.get("plan", "free")
+
+if current_plan == "free":
+    st.info(
+        "Current status: **Free plan** – you can try the tool with lower limits. "
+        "Upgrade below for higher limits and richer summaries."
+    )
+else:
+    plan_name = current_plan.capitalize()
+    st.success(
+        f"Current status: **{plan_name} plan** is active for **{email or 'this email'}**. "
+        "You can start using your higher limits on the **Upload Data** page."
+    )
+
+st.divider()
+
+# ----------------------------- STEP 2: PLANS -------------------------
+
+st.markdown("### Step 2 – Choose a plan")
+
+plans_cols = st.columns(3)
+plan_keys = ["basic", "pro", "enterprise"]
+
+for col, key in zip(plans_cols, plan_keys):
+    cfg = PLAN_CONFIG[key]
+    with col:
+        st.subheader(cfg["name"])
+        st.caption(cfg["price"])
+        st.markdown("\n".join([f"- {line}" for line in cfg["description"]]))
+
+        if current_plan == key:
+            st.button(
+                "Current plan",
+                disabled=True,
+                key=f"{key}_current_btn",
+            )
+        else:
+            btn_label = f"Choose {cfg['name']}"
+            if st.button(btn_label, key=f"{key}_choose_btn"):
+                if not email:
+                    st.error("Please enter and save your email above first (Step 1).")
+                else:
+                    checkout_url = create_checkout_session(email=email, plan_id=key)
+                    if checkout_url:
+                        st.experimental_rerun()  # ensure state is flushed
+                        st.markdown(
+                            f'<meta http-equiv="refresh" content="0; url={checkout_url}"/>',
+                            unsafe_allow_html=True,
+                        )
+
+st.markdown(
+    "After a successful checkout, you’ll be redirected back here with a confirmation "
+    "message at the top of the page. At that point you can continue to **Step 3**."
+)
+
+st.divider()
+
+# ----------------------------- STEP 3: USE THE TOOL ------------------
+
+st.markdown("### Step 3 – Start using your plan")
+
+st.markdown(
+    """
+1. Go to the **Upload Data** page (link below).
+2. Enter the **same email** you used here.
+3. Upload a report or paste your content.
+4. Click **Generate Business Summary** to create a client-ready summary.
+"""
+)
+
+st.markdown("[Open Upload Data →](/Upload_Data)")
