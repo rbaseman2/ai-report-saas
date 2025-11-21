@@ -8,6 +8,7 @@ __pycache__/
 .env.*
 *.sqlite
 *.db
+runtime
 
 # Local data
 data/
