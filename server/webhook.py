@@ -5,7 +5,7 @@ Endpoints
 ---------
 GET  /health                     -> simple health check
 POST /summarize                  -> generate business-friendly summary
-POST /create-checkout-session    -> create Stripe Checkout session
+POST /create-checkout-session    -> create Stripe Checkout session (plan -> price_id)
 POST /stripe/webhook             -> handle Stripe webhooks
 
 Environment variables expected
@@ -255,7 +255,8 @@ class SummarizeResponse(BaseModel):
 
 
 class CheckoutRequest(BaseModel):
-    price_id: str
+    # plan slug from frontend: "basic" | "pro" | "enterprise"
+    plan: Literal["basic", "pro", "enterprise"]
     email: EmailStr
 
 
@@ -357,8 +358,22 @@ def summarize(req: SummarizeRequest):
 
 
 # ----------------------------------------------------------------------
-# Stripe: create Checkout session
+# Stripe: create Checkout session (plan -> price)
 # ----------------------------------------------------------------------
+
+
+def _plan_to_price(plan: str) -> str:
+    """Map plan slug to Stripe price ID using env vars."""
+    plan = plan.lower()
+    mapping = {
+        "basic": PRICE_BASIC,
+        "pro": PRICE_PRO,
+        "enterprise": PRICE_ENTERPRISE,
+    }
+    price_id = mapping.get(plan)
+    if not price_id:
+        raise HTTPException(status_code=400, detail=f"Unknown or unconfigured plan: {plan}")
+    return price_id
 
 
 @app.post("/create-checkout-session", response_model=CheckoutResponse)
@@ -368,13 +383,15 @@ def create_checkout_session(payload: CheckoutRequest):
 
     The frontend should POST:
     {
-        "price_id": "...",
+        "plan": "basic" | "pro" | "enterprise",
         "email": "user@example.com"
     }
     """
 
     if not STRIPE_SECRET_KEY:
         raise HTTPException(status_code=500, detail="Stripe not configured.")
+
+    price_id = _plan_to_price(payload.plan)
 
     success_url = SUCCESS_URL or f"{FRONTEND_URL}/Billing?status=success"
     cancel_url = CANCEL_URL or f"{FRONTEND_URL}/Billing?status=cancelled"
@@ -383,7 +400,7 @@ def create_checkout_session(payload: CheckoutRequest):
         session = stripe.checkout.Session.create(
             mode="subscription",
             payment_method_types=["card"],
-            line_items=[{"price": payload.price_id, "quantity": 1}],
+            line_items=[{"price": price_id, "quantity": 1}],
             customer_email=payload.email,
             allow_promotion_codes=True,
             success_url=success_url + "&session_id={CHECKOUT_SESSION_ID}",
@@ -395,7 +412,7 @@ def create_checkout_session(payload: CheckoutRequest):
 
     logger.info(
         f"Created checkout session {session.id} for {payload.email} "
-        f"price {payload.price_id}"
+        f"plan {payload.plan} (price {price_id})"
     )
     return CheckoutResponse(checkout_url=session.url)
 
