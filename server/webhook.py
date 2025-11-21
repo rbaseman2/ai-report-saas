@@ -1,5 +1,5 @@
 """
-FastAPI backend for AI Report SaaS
+FastAPI backend for AI Report SaaS (DB optional)
 
 Endpoints
 ---------
@@ -18,7 +18,7 @@ PRICE_ENTERPRISE
 SUCCESS_URL          (frontend URL to return after checkout success)
 CANCEL_URL           (optional; fallback is FRONTEND_URL + "/Billing")
 FRONTEND_URL         (ex: "https://ai-report-saas.onrender.com")
-DATABASE_URL         (Render Postgres URL, e.g. from ai-report-db)
+DATABASE_URL         (optional; if missing or psycopg2 missing, DB is disabled)
 OPENAI_API_KEY
 """
 
@@ -29,9 +29,6 @@ from datetime import datetime
 from typing import Optional, Literal
 
 import stripe
-import psycopg2
-from psycopg2.extras import RealDictCursor
-
 from fastapi import FastAPI, Request, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, EmailStr
@@ -43,6 +40,24 @@ from openai import OpenAI
 
 logger = logging.getLogger("webhook")
 logging.basicConfig(level=logging.INFO)
+
+# ----------------------------------------------------------------------
+# Optional DB import (psycopg2 may not support Python 3.13 on Render)
+# ----------------------------------------------------------------------
+
+HAS_DB = True
+try:
+    import psycopg2
+    from psycopg2.extras import RealDictCursor
+except Exception as exc:  # ImportError or binary ABI error
+    HAS_DB = False
+    psycopg2 = None
+    RealDictCursor = None
+    logger.warning(
+        "psycopg2 is not available or incompatible (%s). "
+        "Subscription DB persistence will be disabled.",
+        exc,
+    )
 
 # ----------------------------------------------------------------------
 # Environment & third-party clients
@@ -63,7 +78,7 @@ if not STRIPE_SECRET_KEY:
 if not STRIPE_WEBHOOK_SECRET:
     logger.warning("STRIPE_WEBHOOK_SECRET is not set")
 if not DATABASE_URL:
-    logger.warning("DATABASE_URL is not set")
+    logger.warning("DATABASE_URL is not set (DB persistence disabled)")
 if not SUCCESS_URL:
     logger.warning("SUCCESS_URL is not set – checkout success redirect may fail.")
 
@@ -73,25 +88,37 @@ stripe.api_key = STRIPE_SECRET_KEY
 openai_client = OpenAI()
 
 # ----------------------------------------------------------------------
-# Database helpers
+# Database helpers (no-op if HAS_DB is False)
 # ----------------------------------------------------------------------
+
+
+def db_enabled() -> bool:
+    return HAS_DB and bool(DATABASE_URL)
 
 
 def get_db_connection():
     """
     Open a new database connection.
-    Render manages pooling for us, so simple connections are fine here.
+
+    If DB is not enabled, this raises RuntimeError and callers should
+    treat that as "no persistence available".
     """
-    if not DATABASE_URL:
-        raise RuntimeError("DATABASE_URL is not configured")
+    if not db_enabled():
+        raise RuntimeError("Database is not enabled (no psycopg2 or no DATABASE_URL)")
     return psycopg2.connect(DATABASE_URL, cursor_factory=RealDictCursor)
 
 
 def init_db():
     """
     Ensure a minimal subscriptions table exists.
+
     This is idempotent and safe to run on startup.
+    If DB is not enabled, this is a no-op.
     """
+    if not db_enabled():
+        logger.info("init_db: DB disabled; skipping table creation.")
+        return
+
     try:
         conn = get_db_connection()
     except Exception as exc:
@@ -113,12 +140,13 @@ def init_db():
                 );
                 """
             )
+        logger.info("init_db: subscriptions table ensured.")
     finally:
         conn.close()
 
 
 def upsert_subscription(
-    email: str,
+    email: Optional[str],
     stripe_customer_id: Optional[str],
     stripe_subscription_id: Optional[str],
     plan: Optional[str],
@@ -126,7 +154,23 @@ def upsert_subscription(
 ) -> None:
     """
     Insert or update a subscription row.
+
+    If DB is disabled or email missing, this becomes a no-op.
     """
+    if not db_enabled():
+        logger.info(
+            "upsert_subscription called but DB disabled; "
+            "email=%s status=%s plan=%s",
+            email,
+            status,
+            plan,
+        )
+        return
+
+    if not email:
+        logger.warning("upsert_subscription: email is required but missing.")
+        return
+
     conn = get_db_connection()
     try:
         with conn, conn.cursor() as cur:
@@ -152,7 +196,12 @@ def upsert_subscription(
 def get_subscription(email: str) -> Optional[dict]:
     """
     Fetch subscription info for a given email.
+
+    If DB is disabled, always returns None.
     """
+    if not db_enabled():
+        return None
+
     conn = get_db_connection()
     try:
         with conn, conn.cursor() as cur:
@@ -185,7 +234,7 @@ app.add_middleware(
 def startup_event():
     logger.info("Starting up backend...")
     init_db()
-    logger.info("Database init complete")
+    logger.info("Database init complete (or skipped if disabled).")
 
 
 # ----------------------------------------------------------------------
@@ -224,6 +273,7 @@ def health():
     return {
         "status": "ok",
         "time": datetime.utcnow().isoformat() + "Z",
+        "db_enabled": db_enabled(),
     }
 
 
@@ -359,6 +409,7 @@ def create_checkout_session(payload: CheckoutRequest):
 async def stripe_webhook(request: Request):
     """
     Handle Stripe webhooks to keep local subscription table in sync.
+    If DB is disabled, this still runs but only logs events.
     """
     if not STRIPE_WEBHOOK_SECRET:
         raise HTTPException(status_code=500, detail="Stripe webhook secret not set.")
@@ -404,7 +455,7 @@ async def stripe_webhook(request: Request):
                 plan=price_id,
                 status="active",
             )
-            logger.info(f"checkout.session.completed stored for {email}")
+            logger.info(f"checkout.session.completed stored/logged for {email}")
 
         elif event_type in ("customer.subscription.updated", "customer.subscription.deleted"):
             sub = event["data"]["object"]
@@ -412,10 +463,9 @@ async def stripe_webhook(request: Request):
             subscription_id = sub.get("id")
             status = sub.get("status", "unknown")
 
-            # Try to find by customer_id; if email known from metadata, use that.
             email = sub.get("metadata", {}).get("email")
 
-            if not email and customer_id:
+            if not email and db_enabled() and customer_id:
                 # Fallback: look up any existing row with this customer_id
                 conn = get_db_connection()
                 try:
@@ -430,21 +480,16 @@ async def stripe_webhook(request: Request):
                 finally:
                     conn.close()
 
-            if email:
-                upsert_subscription(
-                    email=email,
-                    stripe_customer_id=customer_id,
-                    stripe_subscription_id=subscription_id,
-                    plan=None,
-                    status=status,
-                )
-                logger.info(
-                    f"Subscription {subscription_id} for {email} updated to status {status}"
-                )
-            else:
-                logger.warning(
-                    "Subscription update received but email could not be resolved."
-                )
+            upsert_subscription(
+                email=email,
+                stripe_customer_id=customer_id,
+                stripe_subscription_id=subscription_id,
+                plan=None,
+                status=status,
+            )
+            logger.info(
+                f"Subscription {subscription_id} for {email} updated to status {status}"
+            )
 
         else:
             logger.info(f"Unhandled Stripe event type: {event_type}")
