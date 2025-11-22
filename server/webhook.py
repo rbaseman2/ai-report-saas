@@ -1,321 +1,244 @@
 # server/webhook.py
 
-"""
-Backend for AI Report SaaS
-
-Exposes:
-- GET  /health                      : simple health check
-- POST /summarize                   : generate a business-friendly summary
-- POST /create-checkout-session     : create a Stripe Checkout session
-- POST /stripe-webhook              : handle Stripe webhooks
-
-This version:
-- Does NOT use psycopg2 or any DB driver.
-- Accepts {"plan": "...", "email": "..."} from the frontend when creating a
-  Checkout session.
-- Attaches the email to the Checkout session via customer_email.
-- Is written to be friendly with your existing Streamlit frontend.
-"""
-
 import os
 import logging
-from typing import Optional, Literal, Dict, Any
+from typing import Optional, Literal
 
-from fastapi import FastAPI, HTTPException, Request, Header
-from fastapi.responses import JSONResponse
+from fastapi import FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, EmailStr
 
 import stripe
 from openai import OpenAI
 
+# ---------------------------------------------------------------------
+# Config
+# ---------------------------------------------------------------------
 
-# ---------------------------------------------------------------------------
-# Basic setup
-# ---------------------------------------------------------------------------
-
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger("ai-report-backend")
-
-app = FastAPI(title="AI Report Backend")
-
-# Stripe keys & config
-STRIPE_SECRET_KEY = os.environ.get("STRIPE_SECRET_KEY")
-STRIPE_WEBHOOK_SECRET = os.environ.get("STRIPE_WEBHOOK_SECRET")
-
-PRICE_BASIC = os.environ.get("PRICE_BASIC")          # price_...
-PRICE_PRO = os.environ.get("PRICE_PRO")              # price_...
-PRICE_ENTERPRISE = os.environ.get("PRICE_ENTERPRISE")
-
-SUCCESS_URL = os.environ.get("SUCCESS_URL")  # e.g. https://ai-report-saas.onrender.com/Billing?status=success
-CANCEL_URL = os.environ.get("CANCEL_URL")    # e.g. https://ai-report-saas.onrender.com/Billing?status=cancel
-
-if STRIPE_SECRET_KEY:
-    stripe.api_key = STRIPE_SECRET_KEY
-else:
-    logger.warning("STRIPE_SECRET_KEY is not set; Stripe routes will fail.")
-
-# OpenAI client
-OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
+# OpenAI
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 if not OPENAI_API_KEY:
-    logger.warning("OPENAI_API_KEY is not set; /summarize will fail without it.")
+    logging.warning("OPENAI_API_KEY is not set – /summarize will fail.")
+client = OpenAI(api_key=OPENAI_API_KEY)
 
-openai_client = OpenAI(api_key=OPENAI_API_KEY)
+# Stripe
+STRIPE_SECRET_KEY = os.getenv("STRIPE_SECRET_KEY")
+if not STRIPE_SECRET_KEY:
+    logging.warning("STRIPE_SECRET_KEY is not set – /create-checkout-session will fail.")
+stripe.api_key = STRIPE_SECRET_KEY
 
-# Map plan names used by the frontend to Stripe price IDs
-PLAN_TO_PRICE: Dict[str, Optional[str]] = {
+PRICE_BASIC = os.getenv("STRIPE_BASIC_PRICE_ID")      # e.g. price_123
+PRICE_PRO = os.getenv("STRIPE_PRO_PRICE_ID")          # e.g. price_456
+PRICE_ENTERPRISE = os.getenv("STRIPE_ENTERPRISE_PRICE_ID")  # e.g. price_789
+
+SUCCESS_URL = os.getenv(
+    "STRIPE_SUCCESS_URL",
+    "https://ai-report-saas.onrender.com/Billing",
+)
+CANCEL_URL = os.getenv(
+    "STRIPE_CANCEL_URL",
+    "https://ai-report-saas.onrender.com/Billing",
+)
+
+PRICE_MAP = {
     "basic": PRICE_BASIC,
     "pro": PRICE_PRO,
     "enterprise": PRICE_ENTERPRISE,
 }
 
+# ---------------------------------------------------------------------
+# FastAPI app
+# ---------------------------------------------------------------------
 
-# ---------------------------------------------------------------------------
-# Pydantic models
-# ---------------------------------------------------------------------------
+app = FastAPI(title="AI Report Backend")
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # you can tighten this later
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+logger = logging.getLogger(__name__)
+logging.basicConfig(level=logging.INFO)
+
+# ---------------------------------------------------------------------
+# Models
+# ---------------------------------------------------------------------
+
 
 class SummarizeRequest(BaseModel):
     text: str
-    email: Optional[EmailStr] = None
-    plan: Optional[str] = None  # "free", "basic", "pro", "enterprise", etc.
-
-    class Config:
-        extra = "ignore"  # ignore any unexpected fields from the frontend
+    max_words: Optional[int] = 400
+    tone: Optional[str] = "professional, clear, concise"
+    audience: Optional[str] = "non-technical business stakeholders"
+    bullets: Optional[bool] = True
 
 
 class SummarizeResponse(BaseModel):
     summary: str
 
 
-class CheckoutRequest(BaseModel):
-    plan: Literal["basic", "pro", "enterprise"]
-    email: EmailStr
+PlanType = Literal["basic", "pro", "enterprise"]
 
-    class Config:
-        extra = "ignore"
+
+class CheckoutRequest(BaseModel):
+    plan: PlanType
+    email: EmailStr
 
 
 class CheckoutResponse(BaseModel):
     checkout_url: str
 
 
-# ---------------------------------------------------------------------------
-# Health check
-# ---------------------------------------------------------------------------
+# ---------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------
+
+
+def build_business_prompt(req: SummarizeRequest) -> str:
+    """Prompt that creates a business-oriented summary."""
+    style = req.tone or "professional, clear, concise"
+    audience = req.audience or "non-technical business stakeholders"
+    max_words = req.max_words or 400
+
+    bullets_instruction = """
+    - Start with a short 1–2 sentence overview.
+    - Then provide a bulleted list of key points, risks, and recommended actions.
+    """.strip() if req.bullets else """
+    - Write as a short narrative summary, with clear paragraphs.
+    """.strip()
+
+    prompt = f"""
+You are an AI assistant that converts long, complex business documents into short,
+client-ready summaries.
+
+Write a summary that a **{audience}** can quickly skim and understand.
+
+Style:
+- {style}
+- Focus on decisions, risks, and next steps.
+- Avoid jargon when possible.
+
+Output format:
+{bullets_instruction}
+
+Limit the answer to **about {max_words} words**.
+
+Here is the source content:
+
+\"\"\"{req.text}\"\"\"
+""".strip()
+
+    return prompt
+
+
+def call_openai(prompt: str) -> str:
+    """Call the OpenAI Responses API (gpt-4.1-mini)."""
+    if not OPENAI_API_KEY:
+        raise RuntimeError("OPENAI_API_KEY is not configured on the server.")
+
+    try:
+        response = client.responses.create(
+            model="gpt-4.1-mini",
+            input=prompt,
+            max_output_tokens=800,
+        )
+        # Responses API structure: response.output[0].content[0].text
+        output = response.output[0].content[0].text  # type: ignore[attr-defined]
+        return output.strip()
+    except Exception as e:
+        logger.exception("Error calling OpenAI: %s", e)
+        raise
+
+
+# ---------------------------------------------------------------------
+# Routes
+# ---------------------------------------------------------------------
+
 
 @app.get("/health")
-def health() -> Dict[str, str]:
-    """
-    Simple health endpoint used by Render to check liveness.
-    """
+def health():
     return {"status": "ok"}
-
-
-# ---------------------------------------------------------------------------
-# Summarization endpoint
-# ---------------------------------------------------------------------------
-
-BUSINESS_SUMMARY_SYSTEM_PROMPT = """
-You are an assistant that turns long business or technical documents into
-clear, client-ready executive summaries.
-
-Write in concise, neutral business language suitable for non-technical
-stakeholders. Focus on:
-- key insights and findings
-- risks or issues
-- decisions made or required
-- clear, concrete recommended next actions
-
-Structure the answer with short sections and bullet points where helpful.
-Avoid medical or patient language — this tool is for general business use.
-"""
 
 
 @app.post("/summarize", response_model=SummarizeResponse)
 def summarize(req: SummarizeRequest):
-    """
-    Generate a business-friendly summary for the given text.
-    """
-    if not OPENAI_API_KEY:
-        raise HTTPException(status_code=500, detail="OpenAI API key not configured.")
+    """Generate a business-friendly summary from raw text."""
+    if not req.text or not req.text.strip():
+        raise HTTPException(status_code=400, detail="No text provided for summarization.")
 
-    text = req.text.strip()
-    if not text:
-        raise HTTPException(status_code=400, detail="Text is empty.")
-
-    # Optional: light guardrails on length based on plan
-    # (You can tune these numbers as you like.)
-    plan = (req.plan or "free").lower()
-    max_chars_by_plan = {
-        "free": 8000,
-        "basic": 20000,
-        "pro": 60000,
-        "enterprise": 120000,
-    }
-    max_chars = max_chars_by_plan.get(plan, max_chars_by_plan["free"])
-    if len(text) > max_chars:
-        text = text[:max_chars]
+    prompt = build_business_prompt(req)
 
     try:
-        completion = openai_client.chat.completions.create(
-            model="gpt-4.1-mini",
-            messages=[
-                {"role": "system", "content": BUSINESS_SUMMARY_SYSTEM_PROMPT},
-                {
-                    "role": "user",
-                    "content": (
-                        "Summarize the following content for business stakeholders. "
-                        "Include key insights, risks, and recommended actions.\n\n"
-                        f"{text}"
-                    ),
-                },
-            ],
-            temperature=0.4,
-            max_tokens=900,
-        )
-        summary_text = completion.choices[0].message.content.strip()
-        return SummarizeResponse(summary=summary_text)
-
+        summary = call_openai(prompt)
     except Exception as e:
-        logger.exception("Error during summarization")
-        raise HTTPException(status_code=500, detail=f"Summarization failed: {e}")
+        raise HTTPException(status_code=500, detail=f"OpenAI error: {e}")
 
+    return SummarizeResponse(summary=summary)
 
-# ---------------------------------------------------------------------------
-# Stripe Checkout session endpoint
-# ---------------------------------------------------------------------------
 
 @app.post("/create-checkout-session", response_model=CheckoutResponse)
 def create_checkout_session(req: CheckoutRequest):
     """
     Create a Stripe Checkout session for a subscription plan.
 
-    The frontend should POST:
+    Frontend should POST JSON:
+
         {
             "plan": "basic" | "pro" | "enterprise",
             "email": "user@example.com"
         }
-
-    We resolve the plan to a Stripe Price ID, attach the email as customer_email,
-    and return the Checkout URL.
     """
     if not STRIPE_SECRET_KEY:
-        raise HTTPException(status_code=500, detail="Stripe API key not configured.")
-
-    price_id = PLAN_TO_PRICE.get(req.plan)
-    if not price_id:
-        logger.error("No Stripe price configured for plan '%s'", req.plan)
-        raise HTTPException(
-            status_code=422,
-            detail=f"No Stripe price configured for plan '{req.plan}'."
-        )
-
-    if not SUCCESS_URL or not CANCEL_URL:
         raise HTTPException(
             status_code=500,
-            detail="SUCCESS_URL or CANCEL_URL is not configured in the backend."
+            detail="Stripe is not configured on the server.",
         )
 
+    price_id = PRICE_MAP.get(req.plan)
+    if not price_id:
+        raise HTTPException(status_code=400, detail=f"Unknown plan: {req.plan}")
+
     try:
-        checkout_session = stripe.checkout.Session.create(
+        session = stripe.checkout.Session.create(
             mode="subscription",
             payment_method_types=["card"],
-            line_items=[{"price": price_id, "quantity": 1}],
-            success_url=SUCCESS_URL,
+            line_items=[
+                {
+                    "price": price_id,
+                    "quantity": 1,
+                }
+            ],
+            customer_email=req.email,
+            success_url=(
+                f"{SUCCESS_URL}"
+                f"?plan={req.plan}&checkout_session_id={{CHECKOUT_SESSION_ID}}"
+            ),
             cancel_url=CANCEL_URL,
-            customer_email=str(req.email),
             allow_promotion_codes=True,
+            automatic_tax={"enabled": True},
             metadata={
                 "plan": req.plan,
-                "app": "ai-report-saas",
+                "email": req.email,
             },
         )
-
-        logger.info(
-            "Created checkout session for %s plan, email=%s, id=%s",
-            req.plan,
-            req.email,
-            checkout_session.id,
-        )
-
-        return CheckoutResponse(checkout_url=checkout_session.url)
-
     except stripe.error.StripeError as e:
-        logger.exception("Stripe error while creating Checkout session")
-        # surface a simplified error to the frontend but log the full details
-        raise HTTPException(
-            status_code=502,
-            detail=f"Stripe error while creating Checkout session: {str(e)}",
-        )
+        logger.exception("Stripe error: %s", e)
+        raise HTTPException(status_code=500, detail=str(e))
     except Exception as e:
-        logger.exception("Unexpected error while creating Checkout session")
-        raise HTTPException(
-            status_code=500,
-            detail=f"Unexpected error while creating Checkout session: {e}",
-        )
+        logger.exception("Unexpected error creating checkout session: %s", e)
+        raise HTTPException(status_code=500, detail="Failed to create checkout session.")
+
+    if not getattr(session, "url", None):
+        raise HTTPException(status_code=500, detail="Stripe did not return a checkout URL.")
+
+    return CheckoutResponse(checkout_url=session.url)
 
 
-# ---------------------------------------------------------------------------
-# Stripe webhook handler
-# ---------------------------------------------------------------------------
-
+# Optional: placeholder for Stripe webhooks (not strictly needed for checkout to work)
 @app.post("/stripe-webhook")
-async def stripe_webhook(
-    request: Request,
-    stripe_signature: str = Header(None, alias="Stripe-Signature"),
-):
-    """
-    Handle Stripe webhook events.
-
-    Currently this just logs events. In the future you can:
-    - mark users as active subscribers
-    - update internal limits, etc.
-    """
-    if not STRIPE_WEBHOOK_SECRET:
-        logger.warning("Stripe webhook called, but STRIPE_WEBHOOK_SECRET is not set.")
-        return JSONResponse(status_code=500, content={"error": "Webhook secret not configured"})
-
-    payload = await request.body()
-
-    try:
-        event = stripe.Webhook.construct_event(
-            payload=payload,
-            sig_header=stripe_signature,
-            secret=STRIPE_WEBHOOK_SECRET,
-        )
-    except ValueError:
-        # Invalid payload
-        logger.exception("Invalid payload in Stripe webhook")
-        return JSONResponse(status_code=400, content={"error": "Invalid payload"})
-    except stripe.error.SignatureVerificationError:
-        # Invalid signature
-        logger.exception("Invalid signature in Stripe webhook")
-        return JSONResponse(status_code=400, content={"error": "Invalid signature"})
-
-    event_type = event["type"]
-    logger.info("Received Stripe event: %s", event_type)
-
-    if event_type == "checkout.session.completed":
-        session: Dict[str, Any] = event["data"]["object"]
-        email = session.get("customer_details", {}).get("email") or session.get("customer_email")
-        plan = session.get("metadata", {}).get("plan")
-
-        logger.info(
-            "Checkout completed: email=%s, plan=%s, session_id=%s",
-            email,
-            plan,
-            session.get("id"),
-        )
-        # Here you could update a real database if you decide to add one.
-
-    # You can add more event handlers (invoice.paid, customer.subscription.deleted, etc.)
-
-    return JSONResponse(status_code=200, content={"status": "ok"})
-
-
-# ---------------------------------------------------------------------------
-# Root (optional)
-# ---------------------------------------------------------------------------
-
-@app.get("/")
-def root():
-    return {"message": "AI Report backend is running"}
+async def stripe_webhook():
+    # You can implement event handling here later (invoice.paid, customer.subscription.updated, etc.)
+    return {"received": True}
