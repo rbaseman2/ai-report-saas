@@ -35,9 +35,9 @@ except ImportError:
 
 # Stripe config from environment
 STRIPE_SECRET_KEY = os.getenv("STRIPE_SECRET_KEY")
-STRIPE_BASIC_PRICE_ID = os.getenv("STRIPE_BASIC_PRICE_ID")
-STRIPE_PRO_PRICE_ID = os.getenv("STRIPE_PRO_PRICE_ID")
-STRIPE_ENTERPRISE_PRICE_ID = os.getenv("STRIPE_ENTERPRISE_PRICE_ID")
+BASIC_PRICE_ID = os.getenv("STRIPE_BASIC_PRICE_ID")
+PRO_PRICE_ID = os.getenv("STRIPE_PRO_PRICE_ID")
+ENTERPRISE_PRICE_ID = os.getenv("STRIPE_ENTERPRISE_PRICE_ID")
 STRIPE_WEBHOOK_SECRET = os.getenv("STRIPE_WEBHOOK_SECRET")
 
 # Frontend URLs (used for Checkout success/cancel)
