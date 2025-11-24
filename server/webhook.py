@@ -35,9 +35,14 @@ except ImportError:
 
 # Stripe config from environment
 STRIPE_SECRET_KEY = os.getenv("STRIPE_SECRET_KEY")
-BASIC_PRICE_ID = os.getenv("STRIPE_BASIC_PRICE_ID")
-PRO_PRICE_ID = os.getenv("STRIPE_PRO_PRICE_ID")
-ENTERPRISE_PRICE_ID = os.getenv("STRIPE_ENTERPRISE_PRICE_ID")
+
+# Support BOTH old and new price ID env names
+STRIPE_BASIC_PRICE_ID = os.getenv("STRIPE_BASIC_PRICE_ID") or os.getenv("PRICE_BASIC")
+STRIPE_PRO_PRICE_ID = os.getenv("STRIPE_PRO_PRICE_ID") or os.getenv("PRICE_PRO")
+STRIPE_ENTERPRISE_PRICE_ID = (
+    os.getenv("STRIPE_ENTERPRISE_PRICE_ID") or os.getenv("PRICE_ENTERPRISE")
+)
+
 STRIPE_WEBHOOK_SECRET = os.getenv("STRIPE_WEBHOOK_SECRET")
 
 # Frontend URLs (used for Checkout success/cancel)
@@ -150,8 +155,11 @@ def _map_plan_to_price_id(plan: PlanSlug) -> str:
     if not pid:
         raise HTTPException(
             status_code=500,
-            detail=f"Stripe price ID not configured for plan '{plan}'. "
-                   f"Set STRIPE_{plan.upper()}_PRICE_ID in the environment.",
+            detail=(
+                f"Stripe price ID not configured for plan '{plan}'. "
+                f"Set STRIPE_{plan.upper()}_PRICE_ID (or PRICE_{plan.upper()}) "
+                f"in the environment."
+            ),
         )
     return pid
 
@@ -168,8 +176,10 @@ def _ensure_openai_configured():
     if client is None:
         raise HTTPException(
             status_code=500,
-            detail="OpenAI is not configured. Set OPENAI_API_KEY in the environment "
-                   "and ensure the 'openai' Python package is installed.",
+            detail=(
+                "OpenAI is not configured. Set OPENAI_API_KEY in the environment "
+                "and ensure the 'openai' Python package is installed."
+            ),
         )
 
 
@@ -189,7 +199,6 @@ async def summarize(req: SummarizeRequest):
     """
     _ensure_openai_configured()
 
-    # Basic length guardrails
     raw_text = req.text.strip()
     if not raw_text:
         raise HTTPException(status_code=400, detail="Text is empty.")
