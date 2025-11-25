@@ -1,330 +1,332 @@
+# streamlit/pages/1_Upload_Data.py
+
 import os
 import io
-from typing import Optional
+from typing import Optional, Tuple
 
 import requests
 import streamlit as st
 
-# ---------------------------------------------------------------------
+# --------------------------------------------------------------------
 # Config
-# ---------------------------------------------------------------------
+# --------------------------------------------------------------------
 
-# Backend base URL – set this in Render as BACKEND_URL for the frontend
-BACKEND_URL = os.environ.get(
+BACKEND_URL = os.getenv(
     "BACKEND_URL",
-    "https://ai-report-backend-ubrx.onrender.com",
-).rstrip("/")
+    "https://ai-report-backend-ubrx.onrender.com",  # default so local dev still works
+)
 
+st.set_page_config(
+    page_title="Upload Data – AI Report",
+    page_icon="📄",
+)
 
-# ---------------------------------------------------------------------
+# --------------------------------------------------------------------
 # Helpers
-# ---------------------------------------------------------------------
+# --------------------------------------------------------------------
 
 
-def get_subscription_status(email: str) -> tuple[str, Optional[str]]:
+def check_subscription(email: str) -> Tuple[dict, Optional[str]]:
     """
-    Call the backend to lookup the user's subscription status.
+    Ask the backend which plan (if any) this email is on.
 
-    Returns:
-        (plan, error_message)
-        plan: "free" | "basic" | "pro" | "enterprise"
-        error_message: Optional error string if the call failed.
+    Returns (subscription_info, error_message).
+    If there's an error, subscription_info will fall back to a "free" plan.
     """
     if not email:
-        return "free", "No email provided."
+        return {"plan": "free", "label": "Free plan"}, "Please enter an email first."
 
     try:
         resp = requests.get(
-            f"{BACKEND_URL}/subscription_status",
+            f"{BACKEND_URL}/subscriptions/verify",
             params={"email": email},
             timeout=10,
         )
-        if resp.status_code != 200:
-            return "free", f"Backend returned {resp.status_code} when checking subscription."
-
-        data = resp.json()
-        plan = str(data.get("plan", "free")).lower()
-        if plan not in {"free", "basic", "pro", "enterprise"}:
-            plan = "free"
-        return plan, None
     except Exception as exc:
-        return "free", f"Unable to reach backend: {exc}"
+        return (
+            {"plan": "free", "label": "Free plan"},
+            f"Could not reach backend while checking subscription: {exc}",
+        )
+
+    if resp.status_code == 200:
+        data = resp.json() or {}
+        plan = data.get("plan", "free") or "free"
+        label = data.get("label") or f"{plan.capitalize()} plan"
+        max_chars = data.get("max_chars")
+        max_docs = data.get("max_docs_per_month")
+
+        info = {
+            "plan": plan,
+            "label": label,
+            "max_chars": max_chars,
+            "max_docs_per_month": max_docs,
+        }
+        return info, None
+
+    if resp.status_code == 404:
+        # No active subscription – treat as free
+        return (
+            {"plan": "free", "label": "Free plan"},
+            None,
+        )
+
+    # Any other status code
+    return (
+        {"plan": "free", "label": "Free plan"},
+        f"Backend returned {resp.status_code} when checking subscription.",
+    )
 
 
-def extract_text_from_file(uploaded_file) -> str:
+def read_text_from_file(uploaded_file) -> str:
     """
-    Best-effort extraction of text from the uploaded file.
+    Turn an uploaded file into plain text for the summarizer.
 
-    For PDFs we try PyPDF2 if available.
-    For TXT / MD / CSV we decode as UTF-8.
-    For DOCX we try python-docx if available.
-
-    If extraction fails, we return an empty string and the user can
-    paste text manually.
+    This is intentionally simple and defensive – it handles the common formats
+    that are easy to parse in a Streamlit app without extra heavy dependencies.
     """
     if uploaded_file is None:
         return ""
 
-    filename = uploaded_file.name or ""
-    ext = filename.lower().rsplit(".", 1)[-1]
+    name = uploaded_file.name.lower()
 
+    # Always read bytes; we'll decode or hand off as needed.
     raw_bytes = uploaded_file.read()
-    uploaded_file.seek(0)  # reset for any future reads
+    if not raw_bytes:
+        return ""
 
-    # Simple text-based types
-    if ext in {"txt", "md", "markdown", "csv"}:
+    # Simple text-ish types just decode as UTF-8 with replacement.
+    if name.endswith((".txt", ".md", ".markdown", ".csv")):
         try:
-            return raw_bytes.decode("utf-8", errors="ignore")
+            return raw_bytes.decode("utf-8", errors="replace")
         except Exception:
-            st.warning("Could not decode the file as UTF-8 text. Please paste the text manually on the right.")
+            return raw_bytes.decode("latin-1", errors="replace")
+
+    # DOCX support (if the dependency is installed)
+    if name.endswith(".docx"):
+        try:
+            import docx2txt  # type: ignore
+
+            # docx2txt expects a file path; we can fake one with BytesIO
+            with io.BytesIO(raw_bytes) as f:
+                text = docx2txt.process(f)
+            return text or ""
+        except Exception:
+            st.warning(
+                "DOCX support requires the `docx2txt` package. "
+                "You can also export your document to PDF or TXT and upload that."
+            )
             return ""
 
-    # PDF
-    if ext == "pdf":
+    # PDF support (if PyPDF2 is installed)
+    if name.endswith(".pdf"):
         try:
-            try:
-                import PyPDF2  # type: ignore
-            except ImportError:
-                st.warning("PDF support requires PyPDF2. Please paste text manually, or ask your developer to add PyPDF2.")
-                return ""
+            from PyPDF2 import PdfReader  # type: ignore
 
-            reader = PyPDF2.PdfReader(io.BytesIO(raw_bytes))
+            reader = PdfReader(io.BytesIO(raw_bytes))
             pages = []
             for page in reader.pages:
                 try:
                     pages.append(page.extract_text() or "")
                 except Exception:
                     continue
-            return "\n\n".join(pages).strip()
-        except Exception as exc:
-            st.warning(f"Could not extract text from PDF ({exc}). Please paste the text manually.")
+            return "\n\n".join(pages)
+        except Exception:
+            st.warning(
+                "PDF support requires the `PyPDF2` package. "
+                "You can also copy-paste the text on the right-hand side."
+            )
             return ""
 
-    # DOCX
-    if ext == "docx":
-        try:
-            try:
-                import docx  # type: ignore
-            except ImportError:
-                st.warning("DOCX support requires python-docx. Please paste text manually, or ask your developer to add it.")
-                return ""
-
-            document = docx.Document(io.BytesIO(raw_bytes))
-            paragraphs = [p.text for p in document.paragraphs]
-            return "\n\n".join(paragraphs).strip()
-        except Exception as exc:
-            st.warning(f"Could not extract text from DOCX ({exc}). Please paste the text manually.")
-            return ""
-
-    st.warning(f"File type '.{ext}' is not supported for automatic text extraction. Please paste text manually.")
-    return ""
+    # Fallback – best-effort decode
+    try:
+        return raw_bytes.decode("utf-8", errors="replace")
+    except Exception:
+        return raw_bytes.decode("latin-1", errors="replace")
 
 
-def generate_summary(email: str, text: str) -> tuple[Optional[str], Optional[str]]:
+def call_summarize_api(email: str, content: str, plan: str) -> Tuple[Optional[str], str]:
     """
-    Call the backend /summarize endpoint with the given text.
+    Call the backend /summarize endpoint.
 
-    Returns:
-        (summary_text, error_message)
+    Returns (summary_text_or_None, error_message_if_any).
     """
-    if not text.strip():
-        return None, "No input text provided."
-
     payload = {
-        "email": email or "",
-        "text": text,
-        # Let backend know which plan we think the user is on, if available.
-        "plan": st.session_state.get("subscription_plan", "free"),
+        "email": email,
+        "content": content,
+        "plan": plan,
     }
 
     try:
         resp = requests.post(
             f"{BACKEND_URL}/summarize",
             json=payload,
-            timeout=120,
+            timeout=90,
         )
-        if resp.status_code != 200:
-            return None, f"Backend returned {resp.status_code}: {resp.text}"
-
-        data = resp.json()
-        summary = data.get("summary") or data.get("summary_text")
-        if not summary:
-            return None, "Backend did not return a summary."
-        return summary, None
     except Exception as exc:
-        return None, f"Unable to reach backend: {exc}"
+        return None, f"Could not reach backend summarizer: {exc}"
+
+    if resp.status_code == 200:
+        data = resp.json() or {}
+        summary = data.get("summary") or data.get("text")
+        if not summary:
+            return None, "Backend responded but did not return a summary."
+        return summary, ""
+
+    # Non-200 – surface a helpful error
+    try:
+        detail = resp.json()
+    except Exception:
+        detail = resp.text
+
+    return None, f"Summarization failed ({resp.status_code}): {detail}"
 
 
-def render_plan_status(plan: str, error: Optional[str]) -> None:
-    """Render the subscription status + guidance text."""
-    plan_label_map = {
-        "free": "Free plan",
-        "basic": "Basic plan",
-        "pro": "Pro plan",
-        "enterprise": "Enterprise plan",
-    }
-    label = plan_label_map.get(plan, "Free plan")
+# --------------------------------------------------------------------
+# Session state initialisation
+# --------------------------------------------------------------------
 
-    st.write("**Status:**", label)
+if "email" not in st.session_state:
+    st.session_state.email = ""
 
-    if error:
-        st.warning(
-            "We couldn’t verify your subscription just now, so we’re treating you as on the "
-            "free plan for this session.\n\n"
-            f"Technical details: {error}"
-        )
-    else:
-        if plan == "free":
-            st.info(
-                "You’re on the **Free plan**. Summaries are shorter and upload limits are lower. "
-                "Upgrade on the Billing page for higher limits and deeper analysis."
-            )
-        elif plan == "basic":
-            st.success(
-                "You’re on the **Basic plan**. You can upload up to 5 documents per month for richer summaries."
-            )
-        elif plan == "pro":
-            st.success(
-                "You’re on the **Pro plan**. You can upload up to 30 documents per month for deeper, "
-                "more structured summaries."
-            )
-        else:  # enterprise
-            st.success(
-                "You’re on the **Enterprise plan** with unlimited uploads and team features."
-            )
+if "subscription" not in st.session_state:
+    st.session_state.subscription = {"plan": "free", "label": "Free plan"}
 
-
-# ---------------------------------------------------------------------
-# Page layout
-# ---------------------------------------------------------------------
-
-st.set_page_config(page_title="Upload Data – AI Report", page_icon="📄", layout="wide")
+# --------------------------------------------------------------------
+# Page UI
+# --------------------------------------------------------------------
 
 st.title("Upload Data & Generate a Business-Friendly Summary")
 st.caption(
-    "Turn dense reports, meeting notes, and long documents into a clear, client-ready summary "
-    "you can drop into emails, slide decks, or status updates."
+    "Turn dense reports, meeting notes, and long documents into a clear, "
+    "client-ready summary you can drop into emails, slide decks, or status updates."
 )
 
-st.markdown("---")
-
-# ---------------------------------------------------------------------
-# Email + subscription section
-# ---------------------------------------------------------------------
+# --- Email + plan status ------------------------------------------------------
 
 st.subheader("Your email")
-st.caption("Use the same email address you subscribed with on the Billing page.")
 
-if "user_email" not in st.session_state:
-    st.session_state["user_email"] = ""
-if "subscription_plan" not in st.session_state:
-    st.session_state["subscription_plan"] = "free"
-if "subscription_error" not in st.session_state:
-    st.session_state["subscription_error"] = None
-
-email = st.text_input("Email address", value=st.session_state["user_email"])
-
-col_email_btn, _ = st.columns([1, 3])
-with col_email_btn:
-    if st.button("Save email & check plan", type="primary"):
-        st.session_state["user_email"] = email.strip()
-        if email.strip():
-            plan, err = get_subscription_status(email.strip())
-            st.session_state["subscription_plan"] = plan
-            st.session_state["subscription_error"] = err
-        else:
-            st.session_state["subscription_plan"] = "free"
-            st.session_state["subscription_error"] = "Please enter an email address."
-
-# Show current status
-render_plan_status(
-    st.session_state.get("subscription_plan", "free"),
-    st.session_state.get("subscription_error"),
+email = st.text_input(
+    "Use the same email address you subscribed with on the Billing page.",
+    value=st.session_state.email,
+    placeholder="you@example.com",
 )
+
+col_save, _ = st.columns([1, 4])
+with col_save:
+    if st.button("Save email & check plan", type="primary"):
+        st.session_state.email = email.strip()
+        sub_info, err = check_subscription(st.session_state.email)
+        st.session_state.subscription = sub_info
+
+        if err:
+            st.warning(
+                "We couldn’t verify your subscription just now, "
+                "so we’re treating you as on the free plan for this session.\n\n"
+                f"Technical details: {err}"
+            )
+        else:
+            if sub_info["plan"] == "free":
+                st.info(
+                    "No active subscription found – you’re currently on the **Free plan**. "
+                    "Summaries may be shorter and upload limits lower."
+                )
+            else:
+                plan_label = sub_info.get("label") or sub_info["plan"].capitalize()
+                st.success(f"Subscription verified – you’re on the **{plan_label}** 🎉")
+
+# Status bar
+plan_label = st.session_state.subscription.get("label", "Free plan")
+st.write("**Status:**", plan_label)
+
+limits_bits = []
+max_chars = st.session_state.subscription.get("max_chars")
+max_docs = st.session_state.subscription.get("max_docs_per_month")
+
+if max_docs:
+    limits_bits.append(f"up to **{max_docs}** documents per month")
+if max_chars:
+    limits_bits.append(f"up to **{max_chars:,}** characters per summary")
+
+if limits_bits:
+    st.caption("Upload limits for your plan: " + " • ".join(limits_bits))
+else:
+    st.caption(
+        "Upload limits and summary depth may vary based on your current subscription."
+    )
 
 st.markdown("---")
 
-# ---------------------------------------------------------------------
-# 1. Add your content
-# ---------------------------------------------------------------------
+# --- Section 1: Add content ---------------------------------------------------
 
 st.subheader("1. Add your content")
 
 left, right = st.columns(2)
 
 with left:
-    st.markdown("#### Upload a file")
-    st.caption("Supported formats: TXT, MD, MARKDOWN, PDF, DOCX, CSV (max 200MB per file).")
-
+    st.markdown("**Upload a file**")
+    st.caption(
+        "Supported formats: TXT, MD, MARKDOWN, PDF, DOCX, CSV (max 200MB per file)."
+    )
     uploaded_file = st.file_uploader(
-        "Drag and drop file here",
+        "Drag and drop a file here",
         type=["txt", "md", "markdown", "pdf", "docx", "csv"],
-        help="Upload a report, memo, or other business document.",
+        label_visibility="collapsed",
     )
 
 with right:
-    st.markdown("#### Or paste text manually")
+    st.markdown("**Or paste text manually**")
     manual_text = st.text_area(
         "Paste meeting notes, reports, or any free-text content.",
         height=260,
+        label_visibility="collapsed",
     )
 
-input_text = ""
-
+# Build combined content + length diagnostics
+file_text = ""
 if uploaded_file is not None:
-    file_text = extract_text_from_file(uploaded_file)
-    if file_text:
-        input_text = file_text
+    file_text = read_text_from_file(uploaded_file)
 
-if manual_text.strip():
-    # If both are present, append manual notes after uploaded text
-    if input_text:
-        input_text = input_text + "\n\n" + manual_text.strip()
-    else:
-        input_text = manual_text.strip()
+combined_text = (file_text or "") + ("\n\n" + manual_text if manual_text.strip() else "")
 
-# ---------------------------------------------------------------------
-# 2. Generate a summary
-# ---------------------------------------------------------------------
+char_count = len(combined_text)
+if char_count > 0:
+    st.write(f"Detected ~**{char_count:,}** characters in total from your upload and text.")
 
-st.markdown("---")
+# --- Section 2: Generate summary ---------------------------------------------
+
+
 st.subheader("2. Generate a summary")
 
-char_count = len(input_text)
-st.caption(f"Detected ~{char_count:,} characters in your input.")
-
-generate_col, _ = st.columns([1, 3])
-
-summary_placeholder = st.empty()
-status_placeholder = st.empty()
-
-with generate_col:
-    generate_clicked = st.button("Generate Business Summary", type="primary")
-
-if generate_clicked:
-    if not input_text.strip():
-        status_placeholder.error("Please upload a file or paste some text before generating a summary.")
+if st.button("Generate Business Summary", type="primary"):
+    if not st.session_state.email:
+        st.error("Please enter and save your email before generating a summary.")
+    elif not combined_text.strip():
+        st.error("Please upload a file or paste some text to summarize.")
     else:
-        status_placeholder.info("Generating summary… This may take a moment.")
-        summary, error = generate_summary(st.session_state.get("user_email", ""), input_text)
-        if error:
-            status_placeholder.error(f"Summarization failed. Details: {error}")
-        else:
-            status_placeholder.success("Summary generated successfully.")
-            summary_placeholder.markdown("### Summary for your client or audience")
-            summary_placeholder.markdown(summary)
+        plan = st.session_state.subscription.get("plan", "free")
+        with st.spinner("Generating your business-friendly summary…"):
+            summary, err = call_summarize_api(
+                email=st.session_state.email,
+                content=combined_text,
+                plan=plan,
+            )
 
-# ---------------------------------------------------------------------
-# 3. Explainer
-# ---------------------------------------------------------------------
+        if err:
+            st.error(err)
+        else:
+            st.success("Summary generated successfully.")
+            st.markdown("### Summary for your client or audience")
+            st.markdown(summary)
+
+# --- Section 3: What this tool does ------------------------------------------
 
 st.markdown("---")
 st.subheader("What this tool does for you")
 
 st.markdown(
     """
-- **Saves time** – Turn dense reports and notes into short, readable summaries.  
-- **Improves clarity** – Highlight key points, risks, decisions, and next steps.  
+- **Saves time** – Turn dense reports and notes into short, readable summaries.
+- **Improves clarity** – Highlight key points, risks, decisions, and next steps.
 - **Helps communication** – Quickly share updates with clients, managers, or your team.
 """
 )
