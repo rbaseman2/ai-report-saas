@@ -48,7 +48,7 @@ PLAN_PRICE_IDS = {
     "enterprise": _env_price("STRIPE_ENTERPRISE_PRICE_ID", "PRICE_ENTERPRISE"),
 }
 
-# Character limits per plan (just an example – tweak as you like)
+# Character limits per plan
 PLAN_LIMITS = {
     "free": 20000,
     "basic": 40000,
@@ -127,8 +127,11 @@ def get_price_id_for_plan(plan: str) -> str:
     if not price_id:
         raise HTTPException(
             status_code=500,
-            detail=f"Stripe price ID not configured for plan '{plan}'. "
-            f"Set STRIPE_{plan.upper()}_PRICE_ID or PRICE_{plan.upper()} in the environment.",
+            detail=(
+                f"Stripe price ID not configured for plan '{plan}'. "
+                f"Set STRIPE_{plan.upper()}_PRICE_ID or PRICE_{plan.upper()} "
+                f"in the environment."
+            ),
         )
     return price_id
 
@@ -329,5 +332,10 @@ async def summarize(payload: SummarizeRequest):
 async def root():
     return {
         "service": "ai-report-backend",
-        "endpoints": ["/health", "/create-checkout-session", "/subscription-status", "/summarize"],
+        "endpoints": [
+            "/health",
+            "/create-checkout-session",
+            "/subscription-status",
+            "/summarize",
+        ],
     }
