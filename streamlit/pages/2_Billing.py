@@ -11,9 +11,7 @@ st.set_page_config(page_title="Billing & Plans – AI Report")
 BACKEND_URL = os.getenv("BACKEND_URL")
 FRONTEND_URL = os.getenv("FRONTEND_URL", "https://ai-report-saas.onrender.com")
 
-# Fallback so the app still works even if BACKEND_URL isn't set
 if not BACKEND_URL:
-    # You can remove this fallback once BACKEND_URL is set in Render
     BACKEND_URL = "https://ai-report-backend-ubrx.onrender.com"
     st.warning(
         "BACKEND_URL was not set in the environment. "
@@ -45,9 +43,7 @@ def subscription_status(email: str):
 
 def create_checkout_session(plan: str, email: str):
     """Start a Stripe Checkout session via the backend."""
-    params = {
-        "status": "success",
-    }
+    params = {"status": "success"}
     success_url = f"{FRONTEND_URL}/Billing?{urlencode(params)}"
     cancel_url = f"{FRONTEND_URL}/Billing?status=cancel"
 
@@ -74,8 +70,10 @@ def create_checkout_session(plan: str, email: str):
 # ---------------------------------------------------------
 # Step 0 – handle return from Stripe
 # ---------------------------------------------------------
-query_params = st.query_params()
-status_param = query_params.get("status", [None])[0]
+# ✅ IMPORTANT: use experimental_get_query_params (not st.query_params())
+query_params = st.experimental_get_query_params()
+status_values = query_params.get("status", [])
+status_param = status_values[0] if status_values else None
 
 if status_param == "success":
     st.success(
@@ -134,9 +132,10 @@ if email and check_button:
             plan_status_placeholder.info(f"Status: **{plan.capitalize()}** plan.")
 
 elif not email:
-    plan_status_placeholder.info("Enter your email above, then click **Save email & check plan**.")
+    plan_status_placeholder.info(
+        "Enter your email above, then click **Save email & check plan**."
+    )
 else:
-    # No button click yet; show last known status if we have it
     plan_status_placeholder.info(
         "Status: Free plan. We haven't detected an active subscription yet. "
         "You can upgrade in Step 2 below."
@@ -154,6 +153,23 @@ if not email:
 
 col_basic, col_pro, col_ent = st.columns(3)
 
+def go_to_checkout(plan_key: str):
+    if not email:
+        return
+    try:
+        with st.spinner("Creating checkout session…"):
+            url = create_checkout_session(plan_key, email)
+        st.success("Redirecting to checkout…")
+        # Clear query params so we don't keep old status messages
+        st.experimental_set_query_params()
+        st.write(f"[Click here if you are not redirected]({url})")
+        st.markdown(
+            f'<meta http-equiv="refresh" content="0; url={url}">',
+            unsafe_allow_html=True,
+        )
+    except Exception as e:
+        st.error(f"Checkout failed: {e}")
+
 with col_basic:
     st.markdown("### Basic")
     st.markdown("**$9.99 / month**")
@@ -163,18 +179,7 @@ with col_basic:
 - Copy-paste summaries into emails, reports, and slide decks
     """)
     if st.button("Choose Basic", key="choose_basic", disabled=not email):
-        try:
-            with st.spinner("Creating checkout session…"):
-                url = create_checkout_session("basic", email)
-            st.success("Redirecting to checkout…")
-            st.experimental_set_query_params()  # clear status
-            st.write(f"[Click here if you are not redirected]({url})")
-            st.markdown(
-                f'<meta http-equiv="refresh" content="0; url={url}">',
-                unsafe_allow_html=True,
-            )
-        except Exception as e:
-            st.error(f"Checkout failed: {e}")
+        go_to_checkout("basic")
 
 with col_pro:
     st.markdown("### Pro")
@@ -185,18 +190,7 @@ with col_pro:
 - Priority email support
     """)
     if st.button("Choose Pro", key="choose_pro", disabled=not email):
-        try:
-            with st.spinner("Creating checkout session…"):
-                url = create_checkout_session("pro", email)
-            st.success("Redirecting to checkout…")
-            st.experimental_set_query_params()
-            st.write(f"[Click here if you are not redirected]({url})")
-            st.markdown(
-                f'<meta http-equiv="refresh" content="0; url={url}">',
-                unsafe_allow_html=True,
-            )
-        except Exception as e:
-            st.error(f"Checkout failed: {e}")
+        go_to_checkout("pro")
 
 with col_ent:
     st.markdown("### Enterprise")
@@ -207,18 +201,7 @@ with col_ent:
 - Premium support & integration help
     """)
     if st.button("Choose Enterprise", key="choose_enterprise", disabled=not email):
-        try:
-            with st.spinner("Creating checkout session…"):
-                url = create_checkout_session("enterprise", email)
-            st.success("Redirecting to checkout…")
-            st.experimental_set_query_params()
-            st.write(f"[Click here if you are not redirected]({url})")
-            st.markdown(
-                f'<meta http-equiv="refresh" content="0; url={url}">',
-                unsafe_allow_html=True,
-            )
-        except Exception as e:
-            st.error(f"Checkout failed: {e}")
+        go_to_checkout("enterprise")
 
 st.markdown("---")
 st.subheader("Step 3 – Start using your plan")
