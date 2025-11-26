@@ -6,7 +6,7 @@ from urllib.parse import urlencode
 st.set_page_config(page_title="Billing & Plans – AI Report")
 
 # ---------------------------------------------------------
-# Config: read from environment (NOT st.secrets)
+# Config: read from environment
 # ---------------------------------------------------------
 BACKEND_URL = os.getenv("BACKEND_URL")
 FRONTEND_URL = os.getenv("FRONTEND_URL", "https://ai-report-saas.onrender.com")
@@ -68,12 +68,15 @@ def create_checkout_session(plan: str, email: str):
 
 
 # ---------------------------------------------------------
-# Step 0 – handle return from Stripe
+# Step 0 – handle return from Stripe (uses st.query_params)
 # ---------------------------------------------------------
-# ✅ IMPORTANT: use experimental_get_query_params (not st.query_params())
-query_params =st.query_params()
-status_values = query_params.get("status", [])
-status_param = status_values[0] if status_values else None
+query_params = st.query_params  # QueryParamsProxy (mapping-like)
+
+raw_status = query_params.get("status", None)
+if isinstance(raw_status, list):
+    status_param = raw_status[0] if raw_status else None
+else:
+    status_param = raw_status
 
 if status_param == "success":
     st.success(
@@ -161,7 +164,7 @@ def go_to_checkout(plan_key: str):
             url = create_checkout_session(plan_key, email)
         st.success("Redirecting to checkout…")
         # Clear query params so we don't keep old status messages
-        st.query_params()
+        st.experimental_set_query_params()
         st.write(f"[Click here if you are not redirected]({url})")
         st.markdown(
             f'<meta http-equiv="refresh" content="0; url={url}">',
