@@ -74,7 +74,7 @@ def create_checkout_session(plan: str, email: str):
 # ---------------------------------------------------------
 # Step 0 – handle return from Stripe
 # ---------------------------------------------------------
-query_params = st.experimental_get_query_params()
+query_params = st.query_params()
 status_param = query_params.get("status", [None])[0]
 
 if status_param == "success":
