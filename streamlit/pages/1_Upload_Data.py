@@ -5,7 +5,7 @@ from io import BytesIO
 # ---------- Config ----------
 st.set_page_config(page_title="Upload Data – AI Report")
 
-BACKEND_URL = st.secrets.get("BACKEND_URL")
+BACKEND_URL = os.getenv("BACKEND_URL")
 
 if not BACKEND_URL:
     st.error(
