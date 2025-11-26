@@ -71,7 +71,7 @@ def create_checkout_session(plan: str, email: str):
 # Step 0 – handle return from Stripe
 # ---------------------------------------------------------
 # ✅ IMPORTANT: use experimental_get_query_params (not st.query_params())
-query_params = st.experimental_get_query_params()
+query_params =st.query_params()
 status_values = query_params.get("status", [])
 status_param = status_values[0] if status_values else None
 
@@ -161,7 +161,7 @@ def go_to_checkout(plan_key: str):
             url = create_checkout_session(plan_key, email)
         st.success("Redirecting to checkout…")
         # Clear query params so we don't keep old status messages
-        st.experimental_set_query_params()
+        st.query_params()
         st.write(f"[Click here if you are not redirected]({url})")
         st.markdown(
             f'<meta http-equiv="refresh" content="0; url={url}">',
