@@ -68,7 +68,7 @@ def create_checkout_session(plan: str, email: str):
 
 
 # ---------------------------------------------------------
-# Step 0 – handle return from Stripe (uses st.query_params)
+# Step 0 – handle return from Stripe (uses st.query_params ONLY)
 # ---------------------------------------------------------
 query_params = st.query_params  # QueryParamsProxy (mapping-like)
 
@@ -163,8 +163,11 @@ def go_to_checkout(plan_key: str):
         with st.spinner("Creating checkout session…"):
             url = create_checkout_session(plan_key, email)
         st.success("Redirecting to checkout…")
-        # Clear query params so we don't keep old status messages
-        st.experimental_set_query_params()
+
+        # NEW: clear query params using the new API (no experimental calls)
+        st.query_params.clear()
+
+        # Provide a manual link and meta refresh
         st.write(f"[Click here if you are not redirected]({url})")
         st.markdown(
             f'<meta http-equiv="refresh" content="0; url={url}">',
