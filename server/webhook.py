@@ -1,345 +1,248 @@
-# server/webhook.py
-
 import os
-from typing import Literal, Optional
+import json
+from typing import Optional, Dict, Any
 
 import stripe
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, Request, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
-# ---------- Env & Stripe setup ----------
+# ---------------------------------------------------------------------------
+# Stripe configuration from environment
+# ---------------------------------------------------------------------------
 
 STRIPE_SECRET_KEY = os.getenv("STRIPE_SECRET_KEY")
-if STRIPE_SECRET_KEY:
-    stripe.api_key = STRIPE_SECRET_KEY
+STRIPE_WEBHOOK_SECRET = os.getenv("STRIPE_WEBHOOK_SECRET")
 
-# Price IDs for your 3 plans
+if not STRIPE_SECRET_KEY:
+    raise RuntimeError("STRIPE_SECRET_KEY is not set in the environment")
+
+stripe.api_key = STRIPE_SECRET_KEY
+
+# Price IDs for each plan (configured in Render env vars)
 PRICE_BASIC_ID = os.getenv("PRICE_BASIC")
 PRICE_PRO_ID = os.getenv("PRICE_PRO")
 PRICE_ENTERPRISE_ID = os.getenv("PRICE_ENTERPRISE")
 
-PLAN_PRICE_IDS = {
+PRICE_BY_PLAN: Dict[str, Optional[str]] = {
     "basic": PRICE_BASIC_ID,
     "pro": PRICE_PRO_ID,
     "enterprise": PRICE_ENTERPRISE_ID,
 }
 
-# Frontend base URL – used in success / cancel URLs
-FRONTEND_URL = os.getenv("FRONTEND_URL", "https://ai-report-saas.onrender.com")
+# Frontend URL used for success & cancel redirect
+FRONTEND_URL = os.getenv(
+    "FRONTEND_URL",
+    # Fallback to your Streamlit frontend
+    "https://ai-report-saas.onrender.com",
+)
 
-# ---------- FastAPI app & CORS ----------
+# ---------------------------------------------------------------------------
+# FastAPI app setup
+# ---------------------------------------------------------------------------
 
-app = FastAPI(title="AI Report Backend")
+app = FastAPI(title="AI Report Backend - Stripe Webhook")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # you can restrict this later to your frontend domain
-    allow_credentials=True,
+    allow_origins=["*"],  # you can tighten this later
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# ---------- Models ----------
 
+# ---------------------------------------------------------------------------
+# Models
+# ---------------------------------------------------------------------------
 
 class CheckoutRequest(BaseModel):
-    plan: Literal["basic", "pro", "enterprise"]
+    """
+    Request body for creating a Stripe Checkout session.
+
+    Example:
+    {
+        "plan": "basic",
+        "email": "user@example.com",
+        "coupon": "MYCOUPON"  # optional
+    }
+    """
+    plan: str
     email: str
-    # Optional: if you ever want to pre-attach a coupon,
-    # you could use this field; currently we just rely on
-    # Stripe's promotion code UI.
-    coupon_code: Optional[str] = None
+    coupon: Optional[str] = None
 
 
-class CheckoutResponse(BaseModel):
-    checkout_url: str
+# ---------------------------------------------------------------------------
+# Health check (for Render)
+# ---------------------------------------------------------------------------
 
-
-class SubscriptionStatusRequest(BaseModel):
-    email: str
-
-
-class SubscriptionStatusResponse(BaseModel):
-    email: str
-    status: Literal["free", "basic", "pro", "enterprise"]
-    plan: Optional[str] = None
-    # You can extend this payload with upload limits, etc.
-    max_documents_per_month: int
-    description: str
-
-
-class SummarizeRequest(BaseModel):
-    text: str
-    max_words: Optional[int] = 400
-    audience: Optional[str] = "business stakeholders and clients"
-
-
-class SummarizeResponse(BaseModel):
-    summary: str
-
-
-# ---------- Health check ----------
-
-# Root – handy if you just hit the backend in a browser.
-@app.get("/")
-async def root():
-    return {"status": "ok", "endpoint": "root"}
-
-
-# Explicit /health route for Render & other probes.
 @app.get("/health")
-async def health():
-    return {"status": "ok", "endpoint": "health"}
-
-# ---------- Stripe: create checkout session ----------
+async def health() -> Dict[str, str]:
+    return {"status": "ok"}
 
 
-@app.post("/create-checkout-session", response_model=CheckoutResponse)
-async def create_checkout_session(payload: CheckoutRequest):
+# ---------------------------------------------------------------------------
+# Create Checkout Session
+# ---------------------------------------------------------------------------
+
+@app.post("/create-checkout-session")
+async def create_checkout_session(body: CheckoutRequest) -> Dict[str, Any]:
     """
     Create a Stripe Checkout session for a subscription plan.
 
-    Frontend should POST:
+    The frontend should POST:
     {
         "plan": "basic" | "pro" | "enterprise",
-        "email": "user@example.com"
+        "email": "user@example.com",
+        "coupon": "OPTIONAL_COUPON_CODE"
     }
     """
-    if not STRIPE_SECRET_KEY:
-        raise HTTPException(
-            status_code=500,
-            detail="Stripe is not configured. Missing STRIPE_SECRET_KEY.",
-        )
+    plan_key = body.plan.lower().strip()
+    price_id = PRICE_BY_PLAN.get(plan_key)
 
-    price_id = PLAN_PRICE_IDS.get(payload.plan)
     if not price_id:
         raise HTTPException(
-            status_code=500,
-            detail=f"Stripe price ID not configured for plan '{payload.plan}'. "
-            f"Set PRICE_{payload.plan.upper()} in the environment.",
+            status_code=400,
+            detail=f"Unknown or unconfigured plan '{body.plan}'. "
+                   f"Check PRICE_BASIC / PRICE_PRO / PRICE_ENTERPRISE env vars.",
         )
 
     try:
-        # URL where the user lands after completing checkout
-        success_url = (
-            f"{FRONTEND_URL}/Billing"
-            "?status=success&session_id={{CHECKOUT_SESSION_ID}}"
-        )
-        # URL if they cancel from the checkout page
-        cancel_url = f"{FRONTEND_URL}/Billing?status=cancelled"
-
-        session = stripe.checkout.Session.create(
-            mode="subscription",
-            payment_method_types=["card"],
-            line_items=[{"price": price_id, "quantity": 1}],
-            success_url=success_url,
-            cancel_url=cancel_url,
-            customer_email=payload.email,
-            # Show "Have a promo code?" box on Stripe page
-            allow_promotion_codes=True,
-            # DO NOT pass customer_creation here – that is only for mode="payment"
-        )
-
-        return CheckoutResponse(checkout_url=session.url)
-
-    except stripe.error.StripeError as e:
-        # Bubble a friendly error up to the UI
-        raise HTTPException(
-            status_code=500,
-            detail=f"Stripe error while creating checkout session: {str(e)}",
-        )
-
-
-# ---------- Stripe: check subscription status ----------
-
-
-def _map_price_to_plan(price_id: str) -> str:
-    """Map a Stripe price ID back to a friendly plan name."""
-    if price_id == PRICE_BASIC_ID:
-        return "basic"
-    if price_id == PRICE_PRO_ID:
-        return "pro"
-    if price_id == PRICE_ENTERPRISE_ID:
-        return "enterprise"
-    return "unknown"
-
-
-def _plan_limits(plan: str) -> tuple[int, str]:
-    """Return (max_documents_per_month, description) for each plan."""
-    if plan == "basic":
-        return 5, "Upload up to 5 documents per month."
-    if plan == "pro":
-        return 30, "Upload up to 30 documents per month."
-    if plan == "enterprise":
-        return 10_000, "Unlimited uploads for your team (practical upper bound)."
-    # free fallback
-    return 2, "Free plan: limited uploads and shorter summaries."
-
-
-@app.post(
-    "/subscription-status", response_model=SubscriptionStatusResponse
-)
-async def subscription_status(
-    payload: SubscriptionStatusRequest,
-):
-    """
-    Check the current subscription status for a given email.
-
-    Frontend POST body:
-    { "email": "user@example.com" }
-    """
-    email = payload.email.strip()
-    if not email:
-        raise HTTPException(status_code=400, detail="Email is required.")
-
-    if not STRIPE_SECRET_KEY:
-        # If Stripe isn't configured, just treat everyone as free
-        max_docs, desc = _plan_limits("free")
-        return SubscriptionStatusResponse(
-            email=email,
-            status="free",
-            plan=None,
-            max_documents_per_month=max_docs,
-            description=desc,
-        )
-
-    try:
-        # 1) Find customer by email
-        customers = stripe.Customer.list(email=email, limit=1).data
-        if not customers:
-            max_docs, desc = _plan_limits("free")
-            return SubscriptionStatusResponse(
-                email=email,
-                status="free",
-                plan=None,
-                max_documents_per_month=max_docs,
-                description=desc,
-            )
-
-        customer = customers[0]
-
-        # 2) Find their first ACTIVE subscription
-        subs = stripe.Subscription.list(
-            customer=customer.id, status="active", limit=1
-        ).data
-
-        if not subs:
-            max_docs, desc = _plan_limits("free")
-            return SubscriptionStatusResponse(
-                email=email,
-                status="free",
-                plan=None,
-                max_documents_per_month=max_docs,
-                description=desc,
-            )
-
-        sub = subs[0]
-        if not sub["items"]["data"]:
-            max_docs, desc = _plan_limits("free")
-            return SubscriptionStatusResponse(
-                email=email,
-                status="free",
-                plan=None,
-                max_documents_per_month=max_docs,
-                description=desc,
-            )
-
-        price = sub["items"]["data"][0]["price"]
-        price_id = price["id"]
-        plan = _map_price_to_plan(price_id)
-
-        if plan == "unknown":
-            # Treat unknown price as free but include a note
-            max_docs, desc = _plan_limits("free")
-            desc = (
-                desc
-                + " (We detected an active Stripe subscription, "
-                "but the price ID isn't mapped to a plan.)"
-            )
-            return SubscriptionStatusResponse(
-                email=email,
-                status="free",
-                plan=None,
-                max_documents_per_month=max_docs,
-                description=desc,
-            )
-
-        max_docs, desc = _plan_limits(plan)
-        return SubscriptionStatusResponse(
-            email=email,
-            status=plan,  # "basic", "pro", or "enterprise"
-            plan=plan,
-            max_documents_per_month=max_docs,
-            description=desc,
-        )
-
-    except stripe.error.StripeError as e:
-        raise HTTPException(
-            status_code=500,
-            detail=f"Stripe error while checking subscription: {str(e)}",
-        )
-
-
-# ---------- OpenAI summarization ----------
-
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-
-try:
-    # Use the official OpenAI client if available
-    from openai import OpenAI
-
-    openai_client: Optional["OpenAI"] = (
-        OpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
-    )
-except Exception:  # pragma: no cover - fail gracefully if library missing
-    openai_client = None
-
-
-@app.post("/summarize", response_model=SummarizeResponse)
-async def summarize(payload: SummarizeRequest):
-    """
-    Turn a long document into a concise, business-friendly summary.
-    """
-    if not openai_client:
-        raise HTTPException(
-            status_code=500,
-            detail="OpenAI is not configured. Set OPENAI_API_KEY in the environment.",
-        )
-
-    text = payload.text.strip()
-    if not text:
-        raise HTTPException(status_code=400, detail="Text is required for summarization.")
-
-    max_words = payload.max_words or 400
-
-    # Construct a clear system prompt
-    system_prompt = (
-        "You are an assistant that writes clear, business-friendly summaries of long "
-        "documents. Highlight key points, risks, decisions, and next steps. "
-        f"Write for an audience of {payload.audience}. "
-        f"Keep the summary under about {max_words} words."
-    )
-
-    try:
-        completion = openai_client.chat.completions.create(
-            model="gpt-4o-mini",
-            messages=[
-                {"role": "system", "content": system_prompt},
+        checkout_kwargs: Dict[str, Any] = {
+            "mode": "subscription",
+            "payment_method_types": ["card"],
+            "customer_email": body.email,
+            "line_items": [
                 {
-                    "role": "user",
-                    "content": (
-                        "Please summarize the following document:\n\n" + text
-                    ),
-                },
+                    "price": price_id,
+                    "quantity": 1,
+                }
             ],
+            "success_url": (
+                f"{FRONTEND_URL}/Billing"
+                "?status=success&session_id={{CHECKOUT_SESSION_ID}}"
+            ),
+            "cancel_url": f"{FRONTEND_URL}/Billing?status=cancelled",
+            # Let Stripe show promotion-code / coupon field
+            "allow_promotion_codes": True,
+            "metadata": {
+                "plan": plan_key,
+                "email": body.email,
+            },
+        }
+
+        # If you want to force a specific coupon code instead of promo box:
+        if body.coupon:
+            checkout_kwargs["discounts"] = [{"coupon": body.coupon}]
+
+        session = stripe.checkout.Session.create(**checkout_kwargs)
+
+        print(
+            f"[create-checkout-session] email={body.email} plan={plan_key} "
+            f"session_id={session.id}"
         )
 
-        summary_text = completion.choices[0].message.content.strip()
-        return SummarizeResponse(summary=summary_text)
+        return {"checkout_url": session.url}
 
+    except stripe.error.StripeError as e:
+        # Surface Stripe error messages to the frontend in a friendly way
+        msg = getattr(e, "user_message", str(e))
+        print(f"[Stripe error] {msg}")
+        raise HTTPException(status_code=500, detail=f"Stripe error: {msg}")
     except Exception as e:
-        raise HTTPException(
-            status_code=500,
-            detail=f"Error while generating summary: {str(e)}",
+        print(f"[create-checkout-session] unexpected error: {e}")
+        raise HTTPException(status_code=500, detail="Error creating checkout session")
+
+
+# ---------------------------------------------------------------------------
+# Stripe Webhook
+# ---------------------------------------------------------------------------
+
+@app.post("/webhook")
+async def stripe_webhook(request: Request) -> Dict[str, bool]:
+    """
+    Handle incoming Stripe webhook events.
+
+    This implementation:
+      - Verifies the signature (if STRIPE_WEBHOOK_SECRET is set)
+      - Logs subscription events
+      - Does NOT touch any database (safe Option A).
+    """
+
+    payload = await request.body()
+    sig_header = request.headers.get("stripe-signature")
+
+    # Verify Stripe signature if a webhook secret is configured
+    if STRIPE_WEBHOOK_SECRET:
+        try:
+            event = stripe.Webhook.construct_event(
+                payload=payload,
+                sig_header=sig_header,
+                secret=STRIPE_WEBHOOK_SECRET,
+            )
+        except ValueError as e:
+            # Invalid JSON
+            print(f"[webhook] Invalid payload: {e}")
+            raise HTTPException(status_code=400, detail="Invalid payload")
+        except stripe.error.SignatureVerificationError as e:
+            # Invalid signature
+            print(f"[webhook] Invalid signature: {e}")
+            raise HTTPException(status_code=400, detail="Invalid signature")
+    else:
+        # Fallback: no verification (NOT recommended for production)
+        print(
+            "[webhook] WARNING: STRIPE_WEBHOOK_SECRET not set. "
+            "Skipping signature verification."
         )
+        try:
+            event = json.loads(payload.decode("utf-8"))
+        except Exception as e:
+            print(f"[webhook] Could not parse JSON payload: {e}")
+            raise HTTPException(status_code=400, detail="Invalid JSON payload")
+
+    event_type = event.get("type")
+    data_obj = event.get("data", {}).get("object", {})
+
+    print(f"[webhook] Received event: {event_type} (id={event.get('id')})")
+
+    # -------------------------------------------------------------------
+    # Subscription lifecycle logging (Option A – logging only)
+    # -------------------------------------------------------------------
+    if event_type == "customer.subscription.created":
+        _log_subscription_event("created", data_obj)
+
+    elif event_type == "customer.subscription.updated":
+        _log_subscription_event("updated", data_obj)
+
+    elif event_type == "customer.subscription.deleted":
+        _log_subscription_event("deleted", data_obj)
+
+    else:
+        print(f"[webhook] Unhandled event type: {event_type}")
+
+    # Stripe expects a 2xx response to consider the event delivered
+    return {"received": True}
+
+
+def _log_subscription_event(action: str, sub_obj: Dict[str, Any]) -> None:
+    """
+    Helper: log subscription details to stdout.
+
+    You can later replace this with real DB writes.
+    """
+    sub_id = sub_obj.get("id")
+    status = sub_obj.get("status")
+
+    # Try to extract a price and email, if available
+    items = sub_obj.get("items", {}).get("data", []) or []
+    price_id = items[0]["price"]["id"] if items else None
+
+    customer_email = (
+        sub_obj.get("customer_email")
+        or sub_obj.get("metadata", {}).get("email")
+    )
+
+    print(
+        f"[subscription.{action}] "
+        f"sub_id={sub_id} status={status} price_id={price_id} email={customer_email}"
+    )
+    # TODO: write to your database here if/when you add DB support
