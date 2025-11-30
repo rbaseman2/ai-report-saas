@@ -81,11 +81,16 @@ class SummarizeResponse(BaseModel):
 
 # ---------- Health check ----------
 
-
+# Root – handy if you just hit the backend in a browser.
 @app.get("/")
-async def health():
-    return {"status": "ok"}
+async def root():
+    return {"status": "ok", "endpoint": "root"}
 
+
+# Explicit /health route for Render & other probes.
+@app.get("/health")
+async def health():
+    return {"status": "ok", "endpoint": "health"}
 
 # ---------- Stripe: create checkout session ----------
 
