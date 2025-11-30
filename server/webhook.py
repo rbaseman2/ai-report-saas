@@ -30,11 +30,16 @@ PRICE_BY_PLAN: Dict[str, Optional[str]] = {
     "enterprise": PRICE_ENTERPRISE_ID,
 }
 
+# Build a reverse lookup from price_id -> plan_key
+PLAN_BY_PRICE: Dict[str, str] = {}
+for plan_key, price_id in PRICE_BY_PLAN.items():
+    if price_id:
+        PLAN_BY_PRICE[price_id] = plan_key
+
 # Frontend URL used for success & cancel redirect
 FRONTEND_URL = os.getenv(
     "FRONTEND_URL",
-    # Fallback to your Streamlit frontend
-    "https://ai-report-saas.onrender.com",
+    "https://ai-report-saas.onrender.com",  # fallback to your Streamlit app
 )
 
 # ---------------------------------------------------------------------------
@@ -45,11 +50,10 @@ app = FastAPI(title="AI Report Backend - Stripe Webhook")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # you can tighten this later
+    allow_origins=["*"],  # tighten later if you want
     allow_methods=["*"],
     allow_headers=["*"],
 )
-
 
 # ---------------------------------------------------------------------------
 # Models
@@ -78,6 +82,78 @@ class CheckoutRequest(BaseModel):
 @app.get("/health")
 async def health() -> Dict[str, str]:
     return {"status": "ok"}
+
+
+# ---------------------------------------------------------------------------
+# Subscription status lookup (used by Billing Step 1)
+# ---------------------------------------------------------------------------
+
+@app.get("/subscription-status")
+async def subscription_status(email: str) -> Dict[str, Any]:
+    """
+    Look up the user's current subscription in Stripe by email.
+
+    Returns:
+    {
+      "status": "active" | "trialing" | "past_due" | "canceled" | "none",
+      "plan": "basic" | "pro" | "enterprise" | null
+    }
+    """
+    if not email:
+        raise HTTPException(status_code=400, detail="Email is required")
+
+    try:
+        # Prefer Stripe's search API if available (matches metadata['email'])
+        subs = None
+        try:
+            subs = stripe.Subscription.search(
+                query=f"metadata['email']:'{email}'",
+                limit=10,
+            )
+            sub_list = list(subs)  # materialize iterator
+        except stripe.error.InvalidRequestError:
+            # Fallback for accounts without Subscription.search enabled
+            sub_list = []
+            # You can adjust limit if you expect more subscriptions
+            all_subs = stripe.Subscription.list(limit=50)
+            for s in all_subs.auto_paging_iter():
+                if (s.get("metadata") or {}).get("email") == email:
+                    sub_list.append(s)
+
+        # Find the most relevant (non-canceled) subscription, if any
+        active_sub = None
+        for s in sub_list:
+            status = s.get("status")
+            if status not in ("incomplete_expired", "canceled"):
+                active_sub = s
+                break
+
+        if not active_sub:
+            # No subscription found
+            return {"status": "none", "plan": None}
+
+        status = active_sub.get("status")
+        items = active_sub.get("items", {}).get("data", []) or []
+        price_id = items[0]["price"]["id"] if items else None
+        plan_key = PLAN_BY_PRICE.get(price_id)
+
+        print(
+            f"[subscription-status] email={email} status={status} "
+            f"price_id={price_id} plan={plan_key}"
+        )
+
+        return {
+            "status": status,
+            "plan": plan_key,
+        }
+
+    except stripe.error.StripeError as e:
+        msg = getattr(e, "user_message", str(e))
+        print(f"[subscription-status] Stripe error: {msg}")
+        raise HTTPException(status_code=500, detail=f"Stripe error: {msg}")
+    except Exception as e:
+        print(f"[subscription-status] unexpected error: {e}")
+        raise HTTPException(status_code=500, detail="Error checking subscription")
 
 
 # ---------------------------------------------------------------------------
@@ -122,7 +198,6 @@ async def create_checkout_session(body: CheckoutRequest) -> Dict[str, Any]:
                 "?status=success&session_id={{CHECKOUT_SESSION_ID}}"
             ),
             "cancel_url": f"{FRONTEND_URL}/Billing?status=cancelled",
-            # Let Stripe show promotion-code / coupon field
             "allow_promotion_codes": True,
             "metadata": {
                 "plan": plan_key,
@@ -130,7 +205,6 @@ async def create_checkout_session(body: CheckoutRequest) -> Dict[str, Any]:
             },
         }
 
-        # If you want to force a specific coupon code instead of promo box:
         if body.coupon:
             checkout_kwargs["discounts"] = [{"coupon": body.coupon}]
 
@@ -144,7 +218,6 @@ async def create_checkout_session(body: CheckoutRequest) -> Dict[str, Any]:
         return {"checkout_url": session.url}
 
     except stripe.error.StripeError as e:
-        # Surface Stripe error messages to the frontend in a friendly way
         msg = getattr(e, "user_message", str(e))
         print(f"[Stripe error] {msg}")
         raise HTTPException(status_code=500, detail=f"Stripe error: {msg}")
@@ -165,13 +238,12 @@ async def stripe_webhook(request: Request) -> Dict[str, bool]:
     This implementation:
       - Verifies the signature (if STRIPE_WEBHOOK_SECRET is set)
       - Logs subscription events
-      - Does NOT touch any database (safe Option A).
+      - Does NOT touch any database (Option A – logging only).
     """
 
     payload = await request.body()
     sig_header = request.headers.get("stripe-signature")
 
-    # Verify Stripe signature if a webhook secret is configured
     if STRIPE_WEBHOOK_SECRET:
         try:
             event = stripe.Webhook.construct_event(
@@ -180,15 +252,12 @@ async def stripe_webhook(request: Request) -> Dict[str, bool]:
                 secret=STRIPE_WEBHOOK_SECRET,
             )
         except ValueError as e:
-            # Invalid JSON
             print(f"[webhook] Invalid payload: {e}")
             raise HTTPException(status_code=400, detail="Invalid payload")
         except stripe.error.SignatureVerificationError as e:
-            # Invalid signature
             print(f"[webhook] Invalid signature: {e}")
             raise HTTPException(status_code=400, detail="Invalid signature")
     else:
-        # Fallback: no verification (NOT recommended for production)
         print(
             "[webhook] WARNING: STRIPE_WEBHOOK_SECRET not set. "
             "Skipping signature verification."
@@ -204,35 +273,25 @@ async def stripe_webhook(request: Request) -> Dict[str, bool]:
 
     print(f"[webhook] Received event: {event_type} (id={event.get('id')})")
 
-    # -------------------------------------------------------------------
-    # Subscription lifecycle logging (Option A – logging only)
-    # -------------------------------------------------------------------
     if event_type == "customer.subscription.created":
         _log_subscription_event("created", data_obj)
-
     elif event_type == "customer.subscription.updated":
         _log_subscription_event("updated", data_obj)
-
     elif event_type == "customer.subscription.deleted":
         _log_subscription_event("deleted", data_obj)
-
     else:
         print(f"[webhook] Unhandled event type: {event_type}")
 
-    # Stripe expects a 2xx response to consider the event delivered
     return {"received": True}
 
 
 def _log_subscription_event(action: str, sub_obj: Dict[str, Any]) -> None:
     """
     Helper: log subscription details to stdout.
-
-    You can later replace this with real DB writes.
     """
     sub_id = sub_obj.get("id")
     status = sub_obj.get("status")
 
-    # Try to extract a price and email, if available
     items = sub_obj.get("items", {}).get("data", []) or []
     price_id = items[0]["price"]["id"] if items else None
 
@@ -245,4 +304,3 @@ def _log_subscription_event(action: str, sub_obj: Dict[str, Any]) -> None:
         f"[subscription.{action}] "
         f"sub_id={sub_id} status={status} price_id={price_id} email={customer_email}"
     )
-    # TODO: write to your database here if/when you add DB support
