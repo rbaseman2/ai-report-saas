@@ -1,6 +1,9 @@
 import streamlit as st
 import requests
 from io import BytesIO
+import os
+
+
 
 # ---------- Config ----------
 st.set_page_config(page_title="Upload Data – AI Report")
