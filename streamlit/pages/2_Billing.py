@@ -5,19 +5,17 @@ import requests
 import streamlit as st
 
 # -------------------------------------------------------------------
-# Backend URL configuration
+# Streamlit config MUST be the first st.* call
 # -------------------------------------------------------------------
+st.set_page_config(page_title="Billing & Plans – AI Report", page_icon="💳")
 
-# Try to read from Streamlit secrets first, then env var, then fallback.
-try:
-    BACKEND_URL = st.secrets["BACKEND_URL"]
-except Exception:
-    BACKEND_URL = os.getenv(
-        "BACKEND_URL",
-        "https://ai-report-backend-ubrx.onrender.com",  # <-- your backend Render URL
-    )
-
-BACKEND_URL = BACKEND_URL.rstrip("/")
+# -------------------------------------------------------------------
+# Backend URL configuration (env var only, no st.secrets)
+# -------------------------------------------------------------------
+BACKEND_URL = os.getenv(
+    "BACKEND_URL",
+    "https://ai-report-backend-ubrx.onrender.com",  # fallback
+).rstrip("/")
 
 
 # -------------------------------------------------------------------
@@ -56,10 +54,8 @@ def get_query_param(name: str, default=None):
 
 
 # -------------------------------------------------------------------
-# Streamlit page
+# Page content
 # -------------------------------------------------------------------
-
-st.set_page_config(page_title="Billing & Plans – AI Report", page_icon="💳")
 
 st.title("Billing & Plans")
 st.write(
