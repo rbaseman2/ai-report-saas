@@ -1,262 +1,185 @@
-import streamlit as st
-import requests
-from io import BytesIO
 import os
+import io
+import textwrap
+import requests
+import streamlit as st
 
+# ------------------------- Page config -------------------------
+st.set_page_config(
+    page_title="Upload Data – AI Report",
+    page_icon="📄",
+)
 
-
-# ---------- Config ----------
-st.set_page_config(page_title="Upload Data – AI Report")
-
-BACKEND_URL = os.getenv("BACKEND_URL")
+# ------------------------- Backend config ----------------------
+BACKEND_URL = os.getenv("BACKEND_URL", "").rstrip("/")
 
 if not BACKEND_URL:
     st.error(
-        "BACKEND_URL is not configured in your Streamlit secrets. "
-        "Add it under `.streamlit/secrets.toml` and redeploy."
+        "BACKEND_URL is not set in the Streamlit environment. "
+        "Set it to your FastAPI URL in Render → Environment."
     )
     st.stop()
 
-st.title("Upload Data & Generate a Business-Friendly Summary")
-st.caption(
-    "Turn dense reports, meeting notes, and long documents into a clear, "
-    "client-ready summary you can drop into emails, slide decks, or status updates."
-)
+# ------------------------- Helpers -----------------------------
 
-# ============================================================
-# Helpers
-# ============================================================
 
-def check_subscription(email: str):
+@st.cache_data(show_spinner=False, ttl=60)
+def fetch_subscription_status(email: str):
     """
-    Call the backend to get the current subscription for this email.
-    Expected API: POST /subscription-status  { email: str }
+    Ask the backend what plan this email is on.
 
     Returns:
-        dict with at least {"plan": "free" | "basic" | "pro" | "enterprise"}
-        or None if the backend is unreachable / error.
+        (plan: str, limits: dict)
+        plan is 'free' | 'basic' | 'pro' | 'enterprise'
     """
     if not email:
-        return None
+        return "free", {"max_documents": 5, "max_chars": 200_000}
 
     try:
-        resp = requests.post(
+        resp = requests.get(
             f"{BACKEND_URL}/subscription-status",
-            json={"email": email},
-            timeout=10,
+            params={"email": email},
+            timeout=20,
         )
-        if resp.status_code == 200:
-            return resp.json()
-        # 404 or anything else => treat as no subscription (free)
-        return {"plan": "free"}
-    except Exception:
-        return None
 
+        # If the backend explicitly says "no subscription" -> treat as free
+        if resp.status_code == 404:
+            return "free", {"max_documents": 5, "max_chars": 200_000}
 
-def extract_text_from_file(uploaded_file) -> str:
-    """
-    Extract text from supported file types.
-    Supported: .txt, .md, .pdf, .docx, .csv (basic text join)
-    """
-    filename = uploaded_file.name.lower()
-
-    # Plain text / markdown
-    if filename.endswith(".txt") or filename.endswith(".md"):
-        return uploaded_file.read().decode("utf-8", errors="ignore")
-
-    # Simple CSV -> just join lines as text
-    if filename.endswith(".csv"):
-        return uploaded_file.read().decode("utf-8", errors="ignore")
-
-    # PDF
-    if filename.endswith(".pdf"):
-        try:
-            from PyPDF2 import PdfReader
-        except ImportError:
-            st.error("PDF support requires PyPDF2 to be installed on the backend environment.")
-            return ""
-        reader = PdfReader(uploaded_file)
-        pages = []
-        for page in reader.pages:
-            text = page.extract_text() or ""
-            pages.append(text)
-        return "\n\n".join(pages)
-
-    # DOCX
-    if filename.endswith(".docx"):
-        try:
-            import docx  # python-docx
-        except ImportError:
-            st.error("DOCX support requires python-docx to be installed on the backend environment.")
-            return ""
-        doc = docx.Document(uploaded_file)
-        return "\n".join(p.text for p in doc.paragraphs)
-
-    st.error("Unsupported file type. Please upload TXT, MD, PDF, DOCX, or CSV.")
-    return ""
-
-
-def call_summarize_api(email: str, text: str, title: str):
-    """
-    Call the backend /summarize endpoint.
-
-    We keep the payload very generic so it stays compatible with your existing FastAPI code.
-    """
-    payload = {
-        "email": email,
-        "title": title,
-        "text": text,
-    }
-
-    resp = requests.post(
-        f"{BACKEND_URL}/summarize",
-        json=payload,
-        timeout=120,
-    )
-
-    if resp.status_code != 200:
-        raise RuntimeError(f"Backend returned {resp.status_code}: {resp.text}")
-
-    # Try JSON first, fall back to raw text
-    try:
+        resp.raise_for_status()
         data = resp.json()
-        return (
-            data.get("summary")
-            or data.get("business_summary")
-            or data.get("patient_summary")
-            or resp.text
-        )
-    except ValueError:
-        return resp.text
+
+        plan = data.get("plan", "free")
+        limits = {
+            "max_documents": data.get("max_documents", 5),
+            "max_chars": data.get("max_chars", 200_000),
+        }
+        return plan, limits
+
+    except Exception as e:
+        # On any error, fail-soft to free, but show a warning
+        st.warning(f"We couldn't verify your subscription (using Free plan for now). Details: {e}")
+        return "free", {"max_documents": 5, "max_chars": 200_000}
 
 
-# ============================================================
-# 1. Email + Subscription Status
-# ============================================================
+def plan_label(plan: str) -> str:
+    return {
+        "free": "Free plan",
+        "basic": "Basic plan",
+        "pro": "Pro plan",
+        "enterprise": "Enterprise plan",
+    }.get(plan, "Free plan")
 
-st.subheader("Your email")
 
-# Prefer the email saved on the Billing page if we have it
-default_email = st.session_state.get("user_email", "")
-email = st.text_input(
-    "Use the same email you subscribed with.",
-    value=default_email,
-    placeholder="you@example.com",
+# ------------------------- UI -----------------------------
+
+
+st.title("Upload Data & Generate a Business-Friendly Summary")
+
+st.write(
+    "Turn dense reports, meeting notes, and long documents into a clear, client-ready summary "
+    "you can drop into emails, slide decks, or status updates."
 )
 
-if email and email != default_email:
-    # Keep session in sync
-    st.session_state["user_email"] = email
+# ----------- Email input (same email as Billing page) ----------
+st.subheader("Your email")
 
-status_placeholder = st.empty()
-sub_info = None
+email = st.text_input(
+    "Use the same email address you subscribed with.",
+    key="upload_email",
+)
+
+plan = "free"
+limits = {"max_documents": 5, "max_chars": 200_000}
 
 if email:
-    sub_info = check_subscription(email)
+    plan, limits = fetch_subscription_status(email)
 
-    if not sub_info:
-        status_placeholder.warning(
-            "We couldn't verify your subscription just now, "
-            "so we're treating you as on the **Free plan** for this session."
-        )
-        plan_label = "free"
-    else:
-        plan_label = sub_info.get("plan", "free")
+# Status banner
+status_text = f"Status: **{plan_label(plan)}**."
+if plan == "free":
+    extra = (
+        " Summaries are shorter and input size is limited. "
+        "Upgrade on the **Billing** page for higher limits and deeper analysis."
+    )
+elif plan == "basic":
+    extra = (
+        f" You can upload up to {limits['max_documents']} documents per month with "
+        f"about {limits['max_chars']:,} characters per summary."
+    )
+elif plan == "pro":
+    extra = (
+        f" You can upload up to {limits['max_documents']} documents per month with "
+        f"about {limits['max_chars']:,} characters per summary."
+    )
+else:  # enterprise
+    extra = " You have our highest limits. Contact us if you hit any ceilings."
 
-    if plan_label == "free":
-        status_placeholder.info(
-            "Status: **Free plan**. Summaries are shorter and input size is limited. "
-            "Upgrade on the **Billing** page for higher limits and deeper analysis."
-        )
-    elif plan_label == "basic":
-        status_placeholder.success(
-            "Status: **Basic plan** – up to 5 documents per month with full-length summaries."
-        )
-    elif plan_label == "pro":
-        status_placeholder.success(
-            "Status: **Pro plan** – up to 30 documents per month with richer analysis."
-        )
-    elif plan_label == "enterprise":
-        status_placeholder.success(
-            "Status: **Enterprise plan** – unlimited uploads for your team."
-        )
-    else:
-        status_placeholder.info(f"Status: **{plan_label}** plan.")
-else:
-    status_placeholder.warning("Enter your email above to check your plan and limits.")
+st.info(status_text + extra)
 
 st.markdown("---")
 
-# ============================================================
-# 2. Upload / Paste content
-# ============================================================
-
+# -------------- 1. Add your content ---------------------
 st.subheader("1. Add your content")
 
-left_col, right_col = st.columns(2)
+st.write("Upload a report or paste your content below. Supported formats: TXT, MD, PDF, DOCX, CSV.")
 
-with left_col:
-    st.markdown("#### Upload a file")
-    st.caption("Supported formats: TXT, MD, PDF, DOCX, CSV (max 200MB per file).")
+uploaded_file = st.file_uploader(
+    "Upload a file",
+    type=["txt", "md", "pdf", "docx", "csv"],
+)
 
-    uploaded_file = st.file_uploader(
-        "Drag and drop a file here",
-        type=["txt", "md", "pdf", "docx", "csv"],
-        label_visibility="collapsed",
-    )
+text_input = st.text_area(
+    "Or paste text manually",
+    height=250,
+    placeholder="Paste meeting notes, reports, or any free-text content...",
+)
 
-with right_col:
-    st.markdown("#### Or paste text manually")
-    manual_text = st.text_area(
-        "Paste meeting notes, reports, or any free-text content.",
-        height=260,
-    )
-
-# Combine text from file + manual paste
-combined_text = ""
-
-if uploaded_file:
-    file_text = extract_text_from_file(uploaded_file)
-    combined_text += file_text
-
-if manual_text:
-    if combined_text:
-        combined_text += "\n\n" + manual_text
-    else:
-        combined_text = manual_text
-
-char_count = len(combined_text)
-st.caption(f"Detected **{char_count:,}** characters in total from your upload and pasted text.")
-
-st.markdown("---")
-
-# ============================================================
-# 3. Generate summary
-# ============================================================
-
+# -------------- 2. Generate summary ---------------------
 st.subheader("2. Generate a summary")
 
-if not email:
-    st.warning("Please enter your email above before generating a summary.")
-    can_generate = False
-else:
-    can_generate = True
+if st.button("Generate Business Summary", type="primary"):
+    if not email:
+        st.error("Please enter your email address above before generating a summary.")
+        st.stop()
 
-generate = st.button("Generate Business Summary", disabled=not can_generate)
+    if not uploaded_file and not text_input.strip():
+        st.error("Please upload a file or paste some text to summarize.")
+        st.stop()
 
-summary_placeholder = st.empty()
+    # Prepare content to send to backend
+    files = None
+    data = {"email": email}
 
-if generate:
-    if not combined_text.strip():
-        summary_placeholder.error("Please upload a file or paste some text before generating a summary.")
+    if uploaded_file is not None:
+        # Send file to backend
+        files = {"file": (uploaded_file.name, uploaded_file.getvalue())}
     else:
-        with st.spinner("Generating your business-friendly summary…"):
-            try:
-                title = uploaded_file.name if uploaded_file else "Uploaded content"
-                summary_text = call_summarize_api(email=email, text=combined_text, title=title)
-            except Exception as e:
-                summary_placeholder.error(f"Summarization failed: {e}")
-            else:
-                st.subheader("Summary for your client or audience")
-                st.markdown(summary_text)
-                st.success("Summary generated successfully.")
+        data["text"] = text_input
+
+    with st.spinner("Generating summary..."):
+        try:
+            resp = requests.post(
+                f"{BACKEND_URL}/summarize",
+                data=data,
+                files=files,
+                timeout=300,
+            )
+            resp.raise_for_status()
+            result = resp.json()
+        except requests.exceptions.RequestException as e:
+            st.error(f"Summarization failed: Backend error: {e}")
+            st.stop()
+
+    summary = result.get("summary")
+    tokens_used = result.get("tokens_used")
+
+    if not summary:
+        st.error("Backend did not return a summary.")
+        st.stop()
+
+    st.markdown("### Summary")
+    st.write(summary)
+
+    if tokens_used is not None:
+        st.caption(f"Approximate tokens used: {tokens_used:,}")
