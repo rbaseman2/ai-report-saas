@@ -5,7 +5,7 @@ import requests
 import streamlit as st
 
 # ❗ MUST be the first Streamlit command on this page
-st.set_page_config(page_title="Billing & Plans", page_icon="💳")
+st.set_page_config(page_title="Billing & Subscription", page_icon="💳")
 
 # ------------------------------------------------------------
 # Helpers
@@ -21,6 +21,8 @@ def _get_backend_url() -> str:
             if key in st.secrets:
                 return str(st.secrets[key]).rstrip("/")
         except Exception:
+            # If secrets.toml doesn't exist, Streamlit shows a warning,
+            # but we just fall back to environment vars.
             pass
 
     # Fallback to environment variable
@@ -134,10 +136,12 @@ if not BACKEND_URL:
 qs = st.query_params
 status_param = qs.get("status", "")
 plan_param = qs.get("plan", "")
+
+# st.query_params values can be list-like; normalise to str
 if isinstance(status_param, list):
-    status_param = status_param[0]
+    status_param = status_param[0] if status_param else ""
 if isinstance(plan_param, list):
-    plan_param = plan_param[0]
+    plan_param = plan_param[0] if plan_param else ""
 
 if status_param == "success":
     st.success(
@@ -147,8 +151,8 @@ if status_param == "success":
 elif status_param == "cancelled":
     st.info("Checkout was cancelled. You have not been charged.")
 
-# Clear query params so the message doesn’t keep reappearing on reload
-st.experimental_set_query_params()
+# ✅ Clear query params using the new API (no experimental_* calls)
+st.query_params.clear()
 
 st.write(
     "Choose a plan that matches how often you need to summarize reports. "
@@ -163,7 +167,8 @@ st.markdown("### Your billing email")
 
 default_email = st.session_state.get("user_email", "")
 email = st.text_input(
-    "We use this email to link your subscription with your account.",
+    "We use this email to link your subscription, upload limits, and summaries. "
+    "Use the same email address you'll use at checkout.",
     value=default_email,
     placeholder="you@company.com",
 )
