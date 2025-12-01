@@ -5,8 +5,11 @@ import io
 import requests
 import streamlit as st
 
+# ❗ MUST be the first Streamlit command on this page
+st.set_page_config(page_title="Upload Data", page_icon="📄")
+
 # ------------------------------------------------------------
-# Helpers (same pattern as Billing page)
+# Helpers
 # ------------------------------------------------------------
 
 def _get_backend_url() -> str:
@@ -23,10 +26,7 @@ def _get_backend_url() -> str:
     return os.getenv("BACKEND_URL", "").rstrip("/")
 
 
-BACKEND_URL = _get_backend_url()
-
-
-def check_subscription_status(email: str):
+def check_subscription_status(email: str, backend_url: str):
     """
     Ask the backend for the current subscription status for this email.
     Returns a dict with: plan, max_documents, max_chars, and a status flag.
@@ -38,7 +38,7 @@ def check_subscription_status(email: str):
         "status": "default",
     }
 
-    if not BACKEND_URL:
+    if not backend_url:
         return {**default, "status": "backend_url_missing"}
 
     if not email:
@@ -46,7 +46,7 @@ def check_subscription_status(email: str):
 
     try:
         resp = requests.get(
-            f"{BACKEND_URL}/subscription-status",
+            f"{backend_url}/subscription-status",
             params={"email": email},
             timeout=10,
         )
@@ -66,49 +66,41 @@ def check_subscription_status(email: str):
         return {**default, "status": "error"}
 
 
-def call_summarize_api(email: str, uploaded_file):
+def call_summarize_api(email: str, uploaded_file, backend_url: str):
     """
     Send the uploaded file + email to the backend /summarize endpoint.
-
-    We assume the backend expects:
-      - multipart/form-data
-      - file: the document
-      - email: the user's email
-      - summary_style: optional hint for tone
-
-    We try to interpret the response flexibly.
     """
-    if not BACKEND_URL:
+    if not backend_url:
         raise RuntimeError("Backend URL is not configured.")
 
-    # Read contents into memory
     file_bytes = uploaded_file.read()
     file_bytes_io = io.BytesIO(file_bytes)
 
     files = {
-        "file": (uploaded_file.name, file_bytes_io, uploaded_file.type or "application/octet-stream")
+        "file": (
+            uploaded_file.name,
+            file_bytes_io,
+            uploaded_file.type or "application/octet-stream",
+        )
     }
     data = {
         "email": email,
-        "summary_style": "client_friendly_business",  # hint for backend prompt
+        "summary_style": "client_friendly_business",
     }
 
     resp = requests.post(
-        f"{BACKEND_URL}/summarize",
+        f"{backend_url}/summarize",
         files=files,
         data=data,
         timeout=120,
     )
     resp.raise_for_status()
 
-    # Try JSON first
     try:
         payload = resp.json()
     except ValueError:
-        # Not JSON, treat as raw text summary
         return {"summary": resp.text}
 
-    # Normalize likely keys
     summary = (
         payload.get("summary")
         or payload.get("summary_markdown")
@@ -116,7 +108,6 @@ def call_summarize_api(email: str, uploaded_file):
         or payload.get("result")
     )
 
-    # Everything else we keep as metadata
     meta = {
         k: v
         for k, v in payload.items()
@@ -130,7 +121,7 @@ def call_summarize_api(email: str, uploaded_file):
 # Page layout
 # ------------------------------------------------------------
 
-st.set_page_config(page_title="Upload Data", page_icon="📄")
+BACKEND_URL = _get_backend_url()
 
 st.title("Upload a report to summarize")
 
@@ -161,7 +152,7 @@ if not email:
     st.info("Enter your email above to check your plan and usage limits.")
     st.stop()
 
-sub = check_subscription_status(email)
+sub = check_subscription_status(email, BACKEND_URL)
 
 plan_label = sub["plan"].capitalize()
 with st.container(border=True):
@@ -206,8 +197,6 @@ summary_focus = st.selectbox(
     ],
 )
 
-# Map UI label to a backend hint (we already send summary_style, but you might
-# later use this in the backend prompt too).
 summary_style_hint = {
     "Client-ready executive summary": "client_ready",
     "Internal team briefing": "internal_briefing",
@@ -226,7 +215,7 @@ if st.button("Generate summary"):
     else:
         with st.spinner("Analyzing your document and generating a summary…"):
             try:
-                result = call_summarize_api(email, uploaded_file)
+                result = call_summarize_api(email, uploaded_file, BACKEND_URL)
             except requests.HTTPError as e:
                 try:
                     err_payload = e.response.json()
@@ -248,11 +237,9 @@ if st.button("Generate summary"):
                 else:
                     st.success("Summary generated successfully.")
 
-                    # Main summary section
                     st.subheader("Executive summary")
                     st.markdown(summary_text)
 
-                    # Optional extra metadata from backend
                     if meta:
                         with st.expander("Technical details & usage info (optional)"):
                             st.json(meta)

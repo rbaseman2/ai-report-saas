@@ -4,6 +4,9 @@ import os
 import requests
 import streamlit as st
 
+# ❗ MUST be the first Streamlit command on this page
+st.set_page_config(page_title="Billing & Plans", page_icon="💳")
+
 # ------------------------------------------------------------
 # Helpers
 # ------------------------------------------------------------
@@ -24,10 +27,7 @@ def _get_backend_url() -> str:
     return os.getenv("BACKEND_URL", "").rstrip("/")
 
 
-BACKEND_URL = _get_backend_url()
-
-
-def check_subscription_status(email: str):
+def check_subscription_status(email: str, backend_url: str):
     """
     Ask the backend for the current subscription status for this email.
     Returns a dict with: plan, max_documents, max_chars, and a status flag.
@@ -39,7 +39,7 @@ def check_subscription_status(email: str):
         "status": "default",
     }
 
-    if not BACKEND_URL:
+    if not backend_url:
         return {**default, "status": "backend_url_missing"}
 
     if not email:
@@ -47,7 +47,7 @@ def check_subscription_status(email: str):
 
     try:
         resp = requests.get(
-            f"{BACKEND_URL}/subscription-status",
+            f"{backend_url}/subscription-status",
             params={"email": email},
             timeout=10,
         )
@@ -69,11 +69,11 @@ def check_subscription_status(email: str):
         return {**default, "status": "error"}
 
 
-def start_checkout(plan: str, email: str):
+def start_checkout(plan: str, email: str, backend_url: str):
     """
     Call the backend to create a Stripe Checkout session.
     """
-    if not BACKEND_URL:
+    if not backend_url:
         st.error("Backend URL is not configured. Please contact support.")
         return
 
@@ -84,7 +84,7 @@ def start_checkout(plan: str, email: str):
     with st.spinner("Contacting billing system…"):
         try:
             resp = requests.post(
-                f"{BACKEND_URL}/create-checkout-session",
+                f"{backend_url}/create-checkout-session",
                 json={"plan": plan, "email": email},
                 timeout=20,
             )
@@ -122,7 +122,7 @@ def start_checkout(plan: str, email: str):
 # Page layout
 # ------------------------------------------------------------
 
-st.set_page_config(page_title="Billing & Plans", page_icon="💳")
+BACKEND_URL = _get_backend_url()
 
 st.title("Billing & Subscription")
 
@@ -175,7 +175,7 @@ if email and email != default_email:
 # Current plan card
 # ------------------------------------------------------------
 
-current_sub = check_subscription_status(email) if email else None
+current_sub = check_subscription_status(email, BACKEND_URL) if email else None
 
 with st.container(border=True):
     st.subheader("Current plan")
@@ -275,7 +275,7 @@ for col, plan in zip(cols, plans_ui):
             if not email:
                 st.error("Please enter your email above before choosing a plan.")
             else:
-                start_checkout(plan["id"], email)
+                start_checkout(plan["id"], email, BACKEND_URL)
 
 st.info(
     "After you subscribe, return to the **Upload Data** tab to start generating "
