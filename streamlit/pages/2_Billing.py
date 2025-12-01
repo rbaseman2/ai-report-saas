@@ -4,32 +4,17 @@ import os
 import requests
 import streamlit as st
 
-# ❗ MUST be the first Streamlit command on this page
+# MUST be the first Streamlit command on this page
 st.set_page_config(page_title="Billing & Subscription", page_icon="💳")
 
 # ------------------------------------------------------------
-# Helpers
+# Config / helpers
 # ------------------------------------------------------------
 
-def _get_backend_url() -> str:
-    """
-    Resolve the backend URL from Streamlit secrets or environment.
-    """
-    # Try common secret keys
-    for key in ("BACKEND_URL", "backend_url", "backendUrl"):
-        try:
-            if key in st.secrets:
-                return str(st.secrets[key]).rstrip("/")
-        except Exception:
-            # If secrets.toml doesn't exist, Streamlit shows a warning,
-            # but we just fall back to environment vars.
-            pass
-
-    # Fallback to environment variable
-    return os.getenv("BACKEND_URL", "").rstrip("/")
+BACKEND_URL = os.getenv("BACKEND_URL", "").rstrip("/")
 
 
-def check_subscription_status(email: str, backend_url: str):
+def check_subscription_status(email: str):
     """
     Ask the backend for the current subscription status for this email.
     Returns a dict with: plan, max_documents, max_chars, and a status flag.
@@ -41,7 +26,7 @@ def check_subscription_status(email: str, backend_url: str):
         "status": "default",
     }
 
-    if not backend_url:
+    if not BACKEND_URL:
         return {**default, "status": "backend_url_missing"}
 
     if not email:
@@ -49,7 +34,7 @@ def check_subscription_status(email: str, backend_url: str):
 
     try:
         resp = requests.get(
-            f"{backend_url}/subscription-status",
+            f"{BACKEND_URL}/subscription-status",
             params={"email": email},
             timeout=10,
         )
@@ -71,11 +56,11 @@ def check_subscription_status(email: str, backend_url: str):
         return {**default, "status": "error"}
 
 
-def start_checkout(plan: str, email: str, backend_url: str):
+def start_checkout(plan: str, email: str):
     """
     Call the backend to create a Stripe Checkout session.
     """
-    if not backend_url:
+    if not BACKEND_URL:
         st.error("Backend URL is not configured. Please contact support.")
         return
 
@@ -86,7 +71,7 @@ def start_checkout(plan: str, email: str, backend_url: str):
     with st.spinner("Contacting billing system…"):
         try:
             resp = requests.post(
-                f"{backend_url}/create-checkout-session",
+                f"{BACKEND_URL}/create-checkout-session",
                 json={"plan": plan, "email": email},
                 timeout=20,
             )
@@ -124,8 +109,6 @@ def start_checkout(plan: str, email: str, backend_url: str):
 # Page layout
 # ------------------------------------------------------------
 
-BACKEND_URL = _get_backend_url()
-
 st.title("Billing & Subscription")
 
 if not BACKEND_URL:
@@ -151,7 +134,7 @@ if status_param == "success":
 elif status_param == "cancelled":
     st.info("Checkout was cancelled. You have not been charged.")
 
-# ✅ Clear query params using the new API (no experimental_* calls)
+# Clear query params using the new API
 st.query_params.clear()
 
 st.write(
@@ -180,7 +163,7 @@ if email and email != default_email:
 # Current plan card
 # ------------------------------------------------------------
 
-current_sub = check_subscription_status(email, BACKEND_URL) if email else None
+current_sub = check_subscription_status(email) if email else None
 
 with st.container(border=True):
     st.subheader("Current plan")
@@ -280,7 +263,7 @@ for col, plan in zip(cols, plans_ui):
             if not email:
                 st.error("Please enter your email above before choosing a plan.")
             else:
-                start_checkout(plan["id"], email, BACKEND_URL)
+                start_checkout(plan["id"], email)
 
 st.info(
     "After you subscribe, return to the **Upload Data** tab to start generating "

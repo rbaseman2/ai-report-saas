@@ -2,35 +2,20 @@
 
 import os
 import io
+import csv
 import requests
 import streamlit as st
 
-# ❗ MUST be the first Streamlit command on this page
-st.set_page_config(page_title="Upload Data", page_icon="📄")
+# Page config MUST be first Streamlit command
+st.set_page_config(page_title="Upload Data – AI Report", page_icon="📄")
+
+BACKEND_URL = os.getenv("BACKEND_URL", "").rstrip("/")
 
 # ------------------------------------------------------------
-# Helpers
+# Shared helpers (match Billing page)
 # ------------------------------------------------------------
 
-def _get_backend_url() -> str:
-    """
-    Resolve the backend URL from Streamlit secrets or environment.
-    """
-    for key in ("BACKEND_URL", "backend_url", "backendUrl"):
-        try:
-            if key in st.secrets:
-                return str(st.secrets[key]).rstrip("/")
-        except Exception:
-            pass
-
-    return os.getenv("BACKEND_URL", "").rstrip("/")
-
-
-def check_subscription_status(email: str, backend_url: str):
-    """
-    Ask the backend for the current subscription status for this email.
-    Returns a dict with: plan, max_documents, max_chars, and a status flag.
-    """
+def check_subscription_status(email: str):
     default = {
         "plan": "free",
         "max_documents": 5,
@@ -38,7 +23,7 @@ def check_subscription_status(email: str, backend_url: str):
         "status": "default",
     }
 
-    if not backend_url:
+    if not BACKEND_URL:
         return {**default, "status": "backend_url_missing"}
 
     if not email:
@@ -46,7 +31,7 @@ def check_subscription_status(email: str, backend_url: str):
 
     try:
         resp = requests.get(
-            f"{backend_url}/subscription-status",
+            f"{BACKEND_URL}/subscription-status",
             params={"email": email},
             timeout=10,
         )
@@ -66,81 +51,53 @@ def check_subscription_status(email: str, backend_url: str):
         return {**default, "status": "error"}
 
 
-def call_summarize_api(email: str, uploaded_file, backend_url: str):
+def summarize_document(email: str, text: str, filename: str, plan: str):
     """
-    Send the uploaded file + email to the backend /summarize endpoint.
+    Call the backend /summarize endpoint.
     """
-    if not backend_url:
-        raise RuntimeError("Backend URL is not configured.")
-
-    file_bytes = uploaded_file.read()
-    file_bytes_io = io.BytesIO(file_bytes)
-
-    files = {
-        "file": (
-            uploaded_file.name,
-            file_bytes_io,
-            uploaded_file.type or "application/octet-stream",
-        )
-    }
-    data = {
-        "email": email,
-        "summary_style": "client_friendly_business",
-    }
-
-    resp = requests.post(
-        f"{backend_url}/summarize",
-        files=files,
-        data=data,
-        timeout=120,
-    )
-    resp.raise_for_status()
+    if not BACKEND_URL:
+        st.error("Backend URL is not configured.")
+        return None
 
     try:
-        payload = resp.json()
-    except ValueError:
-        return {"summary": resp.text}
+        resp = requests.post(
+            f"{BACKEND_URL}/summarize",
+            json={
+                "email": email,
+                "text": text,
+                "filename": filename,
+                "plan": plan,
+            },
+            timeout=120,
+        )
+        resp.raise_for_status()
+        return resp.json()
+    except requests.HTTPError as e:
+        try:
+            detail = resp.json().get("detail")
+        except Exception:
+            detail = resp.text
+        st.error(f"Backend error: {detail or e}")
+    except Exception as e:
+        st.error(f"Error calling summarization backend: {e}")
 
-    summary = (
-        payload.get("summary")
-        or payload.get("summary_markdown")
-        or payload.get("markdown")
-        or payload.get("result")
-    )
-
-    meta = {
-        k: v
-        for k, v in payload.items()
-        if k not in ("summary", "summary_markdown", "markdown", "result")
-    }
-
-    return {"summary": summary, "meta": meta}
-
+    return None
 
 # ------------------------------------------------------------
-# Page layout
+# Page UI
 # ------------------------------------------------------------
 
-BACKEND_URL = _get_backend_url()
-
-st.title("Upload a report to summarize")
+st.title("Upload Data & Generate a Business-Friendly Summary")
 
 if not BACKEND_URL:
     st.error("Backend URL is not configured in this environment.")
     st.stop()
 
-st.caption(
-    "Upload a PDF or Word document and we’ll generate a concise, client-ready summary: "
-    "key insights, risks, and recommended next steps."
-)
-
-# ------------------------------------------------------------
-# Email & plan status
-# ------------------------------------------------------------
-
+# Email – shared with Billing via session_state
+st.markdown("### Your email")
 default_email = st.session_state.get("user_email", "")
 email = st.text_input(
-    "Your email (used to match your subscription)",
+    "Use the same email address you subscribed with on the Billing page.",
     value=default_email,
     placeholder="you@company.com",
 )
@@ -148,103 +105,102 @@ email = st.text_input(
 if email and email != default_email:
     st.session_state["user_email"] = email
 
-if not email:
-    st.info("Enter your email above to check your plan and usage limits.")
-    st.stop()
+sub = check_subscription_status(email) if email else None
+plan_label = (sub["plan"].capitalize() if sub else "Free")
 
-sub = check_subscription_status(email, BACKEND_URL)
-
-plan_label = sub["plan"].capitalize()
 with st.container(border=True):
-    st.subheader("Plan & usage")
-
-    st.markdown(f"**Current plan:** {plan_label}")
-    st.caption(
-        f"You can process up to **{sub['max_documents']}** documents "
-        f"and roughly **{sub['max_chars']:,}** characters per billing period."
-    )
-
-    if sub["plan"] == "free":
-        st.warning(
-            "You’re currently on the Free tier. You can still try the tool, "
-            "but for heavier usage we recommend upgrading in the **Billing** tab."
+    if not email:
+        st.markdown("**Status:** Free plan.")
+        st.caption(
+            "Enter your email to unlock higher limits if you have a paid subscription."
         )
-    elif sub["status"] in ("error", "backend_url_missing"):
-        st.warning(
-            "We couldn’t fully confirm your plan details. "
-            "If you experience limits that don’t match your subscription, please contact support."
+    else:
+        st.markdown(f"**Status:** {plan_label} plan.")
+        st.caption(
+            f"You can upload up to **{sub['max_documents']}** documents "
+            f"and about **{sub['max_chars']:,}** characters in total each month."
         )
+        if sub["status"] == "no_subscription":
+            st.info(
+                "We didn’t find an active subscription for this email, "
+                "so we’re treating you as on the Free plan."
+            )
+        elif sub["status"] == "error":
+            st.warning(
+                "We couldn’t reach the billing system. "
+                "For now, we’re treating you as on the Free plan."
+            )
+
+st.divider()
 
 # ------------------------------------------------------------
-# File upload
+# Upload section
 # ------------------------------------------------------------
 
-st.markdown("### 1. Upload your document")
+st.markdown("### 1. Add your content")
 
 uploaded_file = st.file_uploader(
-    "Upload a PDF or Word document",
-    type=["pdf", "docx", "doc"],
+    "Upload a report file (TXT, MD, PDF, DOCX, CSV).",
+    type=["txt", "md", "pdf", "docx", "csv"],
 )
 
-st.markdown("### 2. Choose how you want the summary framed")
-
-summary_focus = st.selectbox(
-    "Summary focus",
-    [
-        "Client-ready executive summary",
-        "Internal team briefing",
-        "Opportunity & risk overview",
-    ],
+manual_text = st.text_area(
+    "Or paste text manually",
+    placeholder="Paste meeting notes, reports, or any free-text content...",
+    height=200,
 )
 
-summary_style_hint = {
-    "Client-ready executive summary": "client_ready",
-    "Internal team briefing": "internal_briefing",
-    "Opportunity & risk overview": "opportunity_and_risk",
-}[summary_focus]
+st.markdown("### 2. Generate a summary")
 
-# ------------------------------------------------------------
-# Generate summary
-# ------------------------------------------------------------
-
-st.markdown("### 3. Generate summary")
-
-if st.button("Generate summary"):
-    if not uploaded_file:
-        st.error("Please upload a document first.")
+if st.button("Generate Business Summary"):
+    if not email:
+        st.error("Please enter your email address first.")
     else:
-        with st.spinner("Analyzing your document and generating a summary…"):
-            try:
-                result = call_summarize_api(email, uploaded_file, BACKEND_URL)
-            except requests.HTTPError as e:
-                try:
-                    err_payload = e.response.json()
-                    msg = err_payload.get("detail") or err_payload
-                except Exception:
-                    msg = str(e)
-                st.error(f"Backend returned an error: {msg}")
-            except Exception as e:
-                st.error(f"Unexpected error while summarizing: {e}")
+        # Decide source of text
+        if uploaded_file is None and not manual_text.strip():
+            st.error("Upload a file or paste some text to summarize.")
+        else:
+            if manual_text.strip():
+                text = manual_text.strip()
+                filename = "pasted_text.txt"
             else:
-                summary_text = result.get("summary")
-                meta = result.get("meta", {}) or {}
+                filename = uploaded_file.name
+                # Simple handling: for now treat everything as text-ish;
+                # your backend can do more sophisticated parsing.
+                try:
+                    content = uploaded_file.read()
+                    text = content.decode("utf-8", errors="ignore")
+                except Exception as e:
+                    st.error(f"Could not read uploaded file: {e}")
+                    st.stop()
 
-                if not summary_text:
-                    st.warning(
-                        "The backend did not return a summary field. "
-                        "Raw response may be available in the logs."
-                    )
-                else:
-                    st.success("Summary generated successfully.")
+            if len(text) > (sub["max_chars"] if sub else 200_000):
+                st.warning(
+                    "This document is quite large for your current plan. "
+                    "The summary may be truncated."
+                )
 
-                    st.subheader("Executive summary")
-                    st.markdown(summary_text)
+            with st.spinner("Generating your summary…"):
+                result = summarize_document(email, text, filename, sub["plan"] if sub else "free")
 
-                    if meta:
-                        with st.expander("Technical details & usage info (optional)"):
-                            st.json(meta)
+            if result:
+                st.markdown("### Summary")
+                st.write(result.get("summary", ""))
 
-st.caption(
-    "Tip: For the best results, upload reports that have a clear narrative: "
-    "project updates, proposals, financial reviews, or client deliverables."
-)
+                bullets = result.get("key_points")
+                if bullets:
+                    st.markdown("### Key points")
+                    for b in bullets:
+                        st.markdown(f"- {b}")
+
+                risks = result.get("risks")
+                if risks:
+                    st.markdown("### Risks & issues")
+                    for r in risks:
+                        st.markdown(f"- {r}")
+
+                actions = result.get("actions")
+                if actions:
+                    st.markdown("### Recommended next steps")
+                    for a in actions:
+                        st.markdown(f"- {a}")
