@@ -1,271 +1,283 @@
-import os
-from typing import Dict, Tuple
+# streamlit/pages/2_Billing.py
 
+import os
 import requests
 import streamlit as st
 
-# --------------------------------------------------------------------
-# Page config – must be the FIRST Streamlit call
-# --------------------------------------------------------------------
-st.set_page_config(page_title="Billing & Plans – AI Report", page_icon="💳")
-
-# --------------------------------------------------------------------
-# Config
-# --------------------------------------------------------------------
-BACKEND_URL = os.getenv(
-    "BACKEND_URL",
-    "https://ai-report-backend-ubrx.onrender.com",  # <-- keep your actual backend URL here
-).rstrip("/")
-
-DEFAULT_LIMITS = {
-    "max_documents": 5,
-    "max_chars": 200_000,
-}
-
-PLAN_LABELS = {
-    "free": "Free plan",
-    "basic": "Basic",
-    "pro": "Pro",
-    "enterprise": "Enterprise",
-}
-
-
-# --------------------------------------------------------------------
+# ------------------------------------------------------------
 # Helpers
-# --------------------------------------------------------------------
-def _qp(name: str):
-    """Safe helper to read a single query param value."""
-    value = st.query_params.get(name)
-    if isinstance(value, list):
-        return value[0] if value else None
-    return value
+# ------------------------------------------------------------
 
-
-def fetch_subscription(email: str) -> Tuple[str, Dict[str, int]]:
+def _get_backend_url() -> str:
     """
-    Call the backend to get the current subscription for this email.
-
-    Returns (plan, limits_dict).
-    On any error, we gracefully fall back to the Free plan.
+    Resolve the backend URL from Streamlit secrets or environment.
     """
+    # Try common secret keys
+    for key in ("BACKEND_URL", "backend_url", "backendUrl"):
+        try:
+            if key in st.secrets:
+                return str(st.secrets[key]).rstrip("/")
+        except Exception:
+            pass
+
+    # Fallback to environment variable
+    return os.getenv("BACKEND_URL", "").rstrip("/")
+
+
+BACKEND_URL = _get_backend_url()
+
+
+def check_subscription_status(email: str):
+    """
+    Ask the backend for the current subscription status for this email.
+    Returns a dict with: plan, max_documents, max_chars, and a status flag.
+    """
+    default = {
+        "plan": "free",
+        "max_documents": 5,
+        "max_chars": 200_000,
+        "status": "default",
+    }
+
+    if not BACKEND_URL:
+        return {**default, "status": "backend_url_missing"}
+
     if not email:
-        return "free", DEFAULT_LIMITS.copy()
+        return default
 
     try:
         resp = requests.get(
             f"{BACKEND_URL}/subscription-status",
             params={"email": email},
-            timeout=20,
+            timeout=10,
         )
-    except Exception as e:
-        # Backend unreachable (cold start, network, etc.)
-        st.warning(
-            "We couldn’t reach the billing server just now, "
-            "so we’re treating you as on the Free plan for this session."
-        )
-        st.caption(f"Technical details: {e}")
-        return "free", DEFAULT_LIMITS.copy()
+        if resp.status_code == 404:
+            # No active subscription
+            return {**default, "status": "no_subscription"}
 
-    # No active subscription for this email -> treat as Free, but not an error
-    if resp.status_code == 404:
-        return "free", DEFAULT_LIMITS.copy()
-
-    # Any other HTTP error
-    try:
         resp.raise_for_status()
-    except Exception as e:
-        st.error(f"Error while checking subscription: {e}")
-        return "free", DEFAULT_LIMITS.copy()
+        data = resp.json()
+
+        return {
+            "plan": data.get("plan", "free"),
+            "max_documents": data.get("max_documents", 5),
+            "max_chars": data.get("max_chars", 200_000),
+            "status": "ok",
+        }
+    except Exception:
+        # Fail gracefully: treat as free but mark status
+        return {**default, "status": "error"}
+
+
+def start_checkout(plan: str, email: str):
+    """
+    Call the backend to create a Stripe Checkout session.
+    """
+    if not BACKEND_URL:
+        st.error("Backend URL is not configured. Please contact support.")
+        return
+
+    if not email:
+        st.error("Please enter your email address first.")
+        return
+
+    with st.spinner("Contacting billing system…"):
+        try:
+            resp = requests.post(
+                f"{BACKEND_URL}/create-checkout-session",
+                json={"plan": plan, "email": email},
+                timeout=20,
+            )
+        except requests.RequestException as e:
+            st.error(f"Network error starting checkout: {e}")
+            return
+
+    if resp.status_code != 200:
+        # Try to show a helpful error
+        try:
+            payload = resp.json()
+            msg = payload.get("detail") or payload
+        except Exception:
+            msg = resp.text
+        st.error(f"Checkout failed ({resp.status_code}): {msg}")
+        return
 
     data = resp.json() or {}
-    plan = data.get("plan", "free")
-    limits = {
-        "max_documents": data.get("max_documents", DEFAULT_LIMITS["max_documents"]),
-        "max_chars": data.get("max_chars", DEFAULT_LIMITS["max_chars"]),
-    }
-    return plan, limits
-
-
-def create_checkout_session(email: str, plan: str) -> str:
-    """
-    Ask the backend to create a Stripe Checkout session and
-    return the redirect URL.
-    """
-    payload = {"plan": plan, "email": email}
-
-    resp = requests.post(
-        f"{BACKEND_URL}/create-checkout-session",
-        json=payload,
-        timeout=20,
-    )
-    resp.raise_for_status()
-    data = resp.json() or {}
-    url = data.get("checkout_url")
+    url = data.get("url")
     if not url:
-        raise RuntimeError("Backend response did not include 'checkout_url'")
-    return url
+        st.error("Backend did not return a checkout URL.")
+        return
 
+    st.success("Redirecting you to secure checkout…")
+    # Auto redirect in same tab with meta-refresh
+    st.markdown(
+        f"""
+        <meta http-equiv="refresh" content="0; url={url}">
+        <p>If you are not redirected automatically, <a href="{url}">click here</a>.</p>
+        """,
+        unsafe_allow_html=True,
+    )
 
-# --------------------------------------------------------------------
-# Handle return from Stripe (status & session_id query params)
-# --------------------------------------------------------------------
-status = _qp("status")      # "success", "canceled", or None
-session_id = _qp("session_id")
+# ------------------------------------------------------------
+# Page layout
+# ------------------------------------------------------------
 
-if "subscription_plan" not in st.session_state:
-    st.session_state["subscription_plan"] = "free"
-if "limits" not in st.session_state:
-    st.session_state["limits"] = DEFAULT_LIMITS.copy()
+st.set_page_config(page_title="Billing & Plans", page_icon="💳")
 
-if status == "success":
-    # We just came back from Stripe. If we know the user email, try to refresh.
-    email = st.session_state.get("user_email")
-    if email:
-        plan, limits = fetch_subscription(email)
-        st.session_state["subscription_plan"] = plan
-        st.session_state["limits"] = limits
-        st.success(
-            "Checkout complete! We’ve refreshed your subscription "
-            f"for **{email}** (current plan: **{PLAN_LABELS.get(plan, plan)}**)."
-        )
-    else:
-        st.info(
-            "Checkout complete! Enter the same email you used at checkout "
-            "and click **Save email & check plan** to refresh your limits."
-        )
+st.title("Billing & Subscription")
 
-elif status == "canceled":
-    st.info("Your checkout was canceled. You’re still on your current plan.")
+if not BACKEND_URL:
+    st.error("Backend URL is not configured in this environment.")
+    st.stop()
 
+# Handle return from Stripe Checkout (status + plan in query params)
+qs = st.query_params
+status_param = qs.get("status", "")
+plan_param = qs.get("plan", "")
+if isinstance(status_param, list):
+    status_param = status_param[0]
+if isinstance(plan_param, list):
+    plan_param = plan_param[0]
 
-# --------------------------------------------------------------------
-# UI – Step 1: Add your email
-# --------------------------------------------------------------------
-st.title("Billing & Plans")
+if status_param == "success":
+    st.success(
+        "Payment successful. Your subscription is now active. "
+        "You can start uploading reports from the **Upload Data** tab."
+    )
+elif status_param == "cancelled":
+    st.info("Checkout was cancelled. You have not been charged.")
+
+# Clear query params so the message doesn’t keep reappearing on reload
+st.experimental_set_query_params()
 
 st.write(
-    "Use this page to manage your subscription and upgrade your "
-    "document summary limits. Use the same email address at checkout."
+    "Choose a plan that matches how often you need to summarize reports. "
+    "You can upgrade at any time as your workload grows."
 )
 
-st.subheader("Step 1 – Add your email")
+# ------------------------------------------------------------
+# Email capture
+# ------------------------------------------------------------
+
+st.markdown("### Your billing email")
 
 default_email = st.session_state.get("user_email", "")
-email = st.text_input("Email address", value=default_email, placeholder="you@example.com")
-
-col_save, _ = st.columns([1, 3])
-with col_save:
-    if st.button("Save email & check plan", type="primary"):
-        if not email:
-            st.error("Please enter an email address first.")
-        else:
-            st.session_state["user_email"] = email
-
-            plan, limits = fetch_subscription(email)
-            st.session_state["subscription_plan"] = plan
-            st.session_state["limits"] = limits
-
-            label = PLAN_LABELS.get(plan, plan)
-            if plan == "free":
-                st.info(
-                    f"We haven’t detected an active subscription for **{email}**. "
-                    "You’re currently on the **Free plan**."
-                )
-            else:
-                st.success(
-                    f"Subscription found for **{email}**. "
-                    f"Current plan: **{label}**."
-                )
-
-# Show current status
-current_plan = st.session_state.get("subscription_plan", "free")
-st.caption(
-    f"Status: **{PLAN_LABELS.get(current_plan, current_plan)}**. "
-    "You can upgrade in Step 2 below."
+email = st.text_input(
+    "We use this email to link your subscription with your account.",
+    value=default_email,
+    placeholder="you@company.com",
 )
 
+if email and email != default_email:
+    st.session_state["user_email"] = email
 
-# --------------------------------------------------------------------
-# UI – Step 2: Choose a plan
-# --------------------------------------------------------------------
-st.subheader("Step 2 – Choose a plan")
-st.write("Pick the plan that best fits your workload. You can upgrade later as your needs grow.")
+# ------------------------------------------------------------
+# Current plan card
+# ------------------------------------------------------------
 
-if not email:
-    st.info("Enter and save your email in Step 1 before choosing a plan.")
+current_sub = check_subscription_status(email) if email else None
 
-col_basic, col_pro, col_ent = st.columns(3)
+with st.container(border=True):
+    st.subheader("Current plan")
 
-with col_basic:
-    st.markdown("### Basic")
-    st.write("$9.99 / month")
-    st.write("- Upload up to **5 documents per month**")
-    st.write("- Clear AI-generated summaries for clients and stakeholders")
-    st.write("- Copy-paste into emails, reports, and slide decks")
+    if not email:
+        st.caption("Enter your email to see your current subscription status.")
+        st.markdown("**Status:** Free (no subscription found)")
+    else:
+        plan_label = current_sub["plan"].capitalize()
+        st.markdown(f"**Plan:** {plan_label}")
 
-    disabled = not email
-    if st.button("Choose Basic", disabled=disabled):
-        try:
-            checkout_url = create_checkout_session(email, "basic")
-            st.success("Redirecting you to secure checkout…")
-            st.markdown(
-                f"<meta http-equiv='refresh' content='0; url={checkout_url}'>",
-                unsafe_allow_html=True,
+        st.caption(
+            f"Included usage: up to **{current_sub['max_documents']}** documents "
+            f"and roughly **{current_sub['max_chars']:,}** characters per billing period."
+        )
+
+        if current_sub["status"] == "no_subscription":
+            st.info(
+                "We didn’t find an active subscription for this email. "
+                "You are currently on the Free tier."
             )
-            st.markdown(f"[Click here if you’re not redirected]({checkout_url})")
-        except Exception as e:
-            st.error(f"Checkout failed: {e}")
-
-with col_pro:
-    st.markdown("### Pro")
-    st.write("$19.99 / month")
-    st.write("- Upload up to **30 documents per month**")
-    st.write("- Deeper, more structured summaries (key points, risks, and action items)")
-    st.write("- Priority email support")
-
-    disabled = not email
-    if st.button("Choose Pro", disabled=disabled):
-        try:
-            checkout_url = create_checkout_session(email, "pro")
-            st.success("Redirecting you to secure checkout…")
-            st.markdown(
-                f"<meta http-equiv='refresh' content='0; url={checkout_url}'>",
-                unsafe_allow_html=True,
+        elif current_sub["status"] == "error":
+            st.warning(
+                "We couldn’t reach the billing system. "
+                "For now, we’re treating you as on the Free tier."
             )
-            st.markdown(f"[Click here if you’re not redirected]({checkout_url})")
-        except Exception as e:
-            st.error(f"Checkout failed: {e}")
 
-with col_ent:
-    st.markdown("### Enterprise")
-    st.write("$39.99 / month")
-    st.write("- **Unlimited uploads** for your team")
-    st.write("- Team accounts and shared templates")
-    st.write("- Premium support & integration help")
+    st.caption(
+        "Your plan controls how many reports you can upload and the maximum length "
+        "we can summarize each month."
+    )
 
-    disabled = not email
-    if st.button("Choose Enterprise", disabled=disabled):
-        try:
-            checkout_url = create_checkout_session(email, "enterprise")
-            st.success("Redirecting you to secure checkout…")
-            st.markdown(
-                f"<meta http-equiv='refresh' content='0; url={checkout_url}'>",
-                unsafe_allow_html=True,
-            )
-            st.markdown(f"[Click here if you’re not redirected]({checkout_url})")
-        except Exception as e:
-            st.error(f"Checkout failed: {e}")
+st.divider()
 
+# ------------------------------------------------------------
+# Plan comparison grid
+# ------------------------------------------------------------
 
-# --------------------------------------------------------------------
-# UI – Step 3: Start using your plan
-# --------------------------------------------------------------------
-st.subheader("Step 3 – Start using your plan")
-st.markdown(
-    """
-1. Go to the **Upload Data** page (link in the sidebar on the left).  
-2. Enter the **same email** you used here.  
-3. Upload a report or paste your content.  
-4. Click **Generate Business Summary** to create a client-ready summary.
-"""
+st.subheader("Compare plans")
+
+cols = st.columns(3)
+
+plans_ui = [
+    {
+        "id": "basic",
+        "name": "Basic",
+        "price": "$9.99 / month",
+        "ideal_for": "Solo professionals & light usage",
+        "features": [
+            "Up to 20 reports / month",
+            "Up to 400k characters / month",
+            "Executive summaries + key insights",
+        ],
+    },
+    {
+        "id": "pro",
+        "name": "Pro",
+        "price": "$19.99 / month",
+        "ideal_for": "Consultants & small teams",
+        "features": [
+            "Up to 75 reports / month",
+            "Up to 1.5M characters / month",
+            "Action items, risks, and opportunity insights",
+        ],
+    },
+    {
+        "id": "enterprise",
+        "name": "Enterprise",
+        "price": "$49.99 / month",
+        "ideal_for": "Teams with heavy reporting needs",
+        "features": [
+            "Up to 250 reports / month",
+            "Up to 5M characters / month",
+            "Priority processing & extended history",
+        ],
+    },
+]
+
+for col, plan in zip(cols, plans_ui):
+    with col:
+        st.markdown(f"### {plan['name']}")
+        st.markdown(f"**{plan['price']}**")
+        st.caption(plan["ideal_for"])
+
+        for feat in plan["features"]:
+            st.markdown(f"- {feat}")
+
+        if current_sub and current_sub["plan"] == plan["id"]:
+            st.success("Current plan")
+            disabled = True
+            label = "Selected"
+        else:
+            disabled = False
+            label = f"Choose {plan['name']}"
+
+        if st.button(label, key=f"btn_{plan['id']}", disabled=disabled):
+            if not email:
+                st.error("Please enter your email above before choosing a plan.")
+            else:
+                start_checkout(plan["id"], email)
+
+st.info(
+    "After you subscribe, return to the **Upload Data** tab to start generating "
+    "client-ready summaries from your reports."
 )
