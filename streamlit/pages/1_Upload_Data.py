@@ -1,129 +1,118 @@
-# pages/1_Upload_Data.py
-# Upload Data – always send email to /summarize and show debug info
-
-import os
-import requests
 import streamlit as st
+import requests
+import os
 
-# ---------------------------------------------------------------------
-# Streamlit config (must be first Streamlit call)
-# ---------------------------------------------------------------------
+# -------------------------------
+# CONFIG
+# -------------------------------
 st.set_page_config(page_title="Upload Data – AI Report", page_icon="📄")
 
-# ---------------------------------------------------------------------
-# Backend config
-# ---------------------------------------------------------------------
-BACKEND_URL = os.getenv(
-    "BACKEND_URL",
-    "https://ai-report-backend-ubx.onrender.com",  # your Render backend
-)
+BACKEND_URL = os.getenv("BACKEND_URL")
 
+if not BACKEND_URL:
+    st.error("Backend URL missing. Set BACKEND_URL in Render environment variables.")
+    st.stop()
+
+# -------------------------------
+# PAGE TITLE
+# -------------------------------
 st.title("Upload Data & Generate a Business-Friendly Summary")
-st.write(
-    "Turn dense reports, meeting notes, and long documents into clear, "
-    "client-ready summaries you can drop into emails, slide decks, or status updates."
-)
 
-# ---------------------------------------------------------------------
-# Email used for billing & summarization
-# ---------------------------------------------------------------------
-st.subheader("Your email")
+st.write("""
+Turn dense reports, notes, and long documents into a clear business summary.
+Use the same email you subscribed with.
+""")
 
-saved_email = st.session_state.get("billing_email", "")
-
-email_input = st.text_input(
-    "Use the same email you subscribed with:",
-    value=saved_email,
+# -------------------------------
+# EMAIL FIELD (required)
+# -------------------------------
+email = st.text_input(
+    "Your email",
+    value=st.session_state.get("billing_email", ""),
     placeholder="you@example.com",
+    help="Use the same email you subscribed with on the Billing page."
 )
 
-# keep email in session so Billing page and Upload page stay in sync
-if email_input:
-    st.session_state["billing_email"] = email_input
+# Keep in session
+st.session_state["billing_email"] = email
 
-if not email_input:
-    st.info("Enter your billing email above before generating a summary.")
 
-# ---------------------------------------------------------------------
-# Upload / paste content
-# ---------------------------------------------------------------------
+# -------------------------------
+# FILE UPLOAD OR TEXT AREA
+# -------------------------------
 st.subheader("1. Add your content")
 
 uploaded_file = st.file_uploader(
-    "Upload a report file (TXT, MD, PDF, DOCX, CSV).",
-    type=["txt", "md", "pdf", "docx", "csv"],
+    "Upload a report file (TXT, MD, PDF, DOCX, CSV). Max 200MB per file.",
+    type=["txt", "md", "pdf", "docx", "csv"]
 )
 
-manual_text = st.text_area(
+pasted_text = st.text_area(
     "Or paste text manually",
-    height=200,
-    placeholder="Paste meeting notes, reports, or any free-text content…",
+    height=250,
+    placeholder="Paste meeting notes, reports, or any free-text content…"
 )
 
-content_text = ""
-filename = "manual_input.txt"
+combined_text = ""
 
-if uploaded_file is not None:
+filename = None
+
+if uploaded_file:
     filename = uploaded_file.name
-    try:
-        content_text = uploaded_file.read().decode("utf-8", errors="ignore")
-    except Exception:
-        content_text = ""
-elif manual_text.strip():
-    content_text = manual_text.strip()
+    combined_text = uploaded_file.read().decode(errors="ignore")
 
-# ---------------------------------------------------------------------
-# Generate summary
-# ---------------------------------------------------------------------
+elif pasted_text.strip():
+    filename = "pasted_text.txt"
+    combined_text = pasted_text
+
+
+# -------------------------------
+# GENERATE SUMMARY
+# -------------------------------
 st.subheader("2. Generate a summary")
 
-if st.button("Generate Business Summary", type="primary"):
-    # front-end validation
-    if not email_input:
-        st.error("Please enter the email you used at checkout.")
+if st.button("Generate Business Summary"):
+
+    # Validate inputs
+    if not email:
+        st.error("Please enter your email before generating a summary.")
         st.stop()
 
-    if not content_text:
-        st.error("Please upload a file or paste some text before summarizing.")
+    if not combined_text.strip():
+        st.error("Please upload a file or paste text before generating a summary.")
         st.stop()
 
+    # Build the payload EXACTLY how the backend expects it
     payload = {
-        "email": email_input,          # <-- this MUST match backend model
-        "text_content": content_text,
+        "email": email,                        # ← REQUIRED
+        "content": combined_text,              # ← REQUIRED
         "filename": filename,
-        "num_chars": len(content_text),
+        "char_count": len(combined_text)
     }
 
-    # TEMP: show what we’re actually sending to the backend
-    with st.expander("Debug: request payload being sent to /summarize", expanded=False):
+    # Debug panel
+    with st.expander("Debug: request payload being sent to /summarize"):
         st.json(payload)
 
-    with st.spinner("Contacting the AI engine…"):
-        try:
-            resp = requests.post(
-                f"{BACKEND_URL}/summarize",
-                json=payload,
-                timeout=120,
-            )
+    # Send request to backend
+    try:
+        response = requests.post(
+            f"{BACKEND_URL}/summarize",
+            json=payload,
+            timeout=120
+        )
+    except Exception as e:
+        st.error(f"Network or backend error: {e}")
+        st.stop()
 
-            if not resp.ok:
-                st.error(f"Backend returned {resp.status_code}: {resp.reason}")
-                # show backend's validation details (e.g. 422 errors)
-                try:
-                    st.json(resp.json())
-                except Exception:
-                    st.write(resp.text)
-                st.stop()
+    # Show backend errors clearly
+    if response.status_code != 200:
+        st.error(f"Backend returned {response.status_code}: {response.text}")
+        st.stop()
 
-            data = resp.json()
+    # SUCCESS
+    result = response.json()
+    st.success("Summary generated successfully!")
 
-            st.success("Summary generated successfully!")
-            summary_text = data.get("summary", "")
-            if summary_text:
-                st.markdown("### Summary")
-                st.write(summary_text)
-            else:
-                st.warning("Backend responded without a `summary` field.")
-
-        except requests.exceptions.RequestException as e:
-            st.error(f"Network or backend error: {e}")
+    st.subheader("Your Summary")
+    st.write(result.get("summary", "(No summary returned)"))
