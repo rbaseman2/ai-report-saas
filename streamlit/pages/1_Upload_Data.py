@@ -1,47 +1,51 @@
-# 1_Upload_Data.py  – clean & fixed version
+# 1_Upload_Data.py – fixed so email is always sent to /summarize
 
 import os
 import requests
 import streamlit as st
 
-# -----------------------------------------------------------------------------
-# Config
-# -----------------------------------------------------------------------------
+# ---------------------------------------------------------------------
+# Streamlit config MUST be first Streamlit call
+# ---------------------------------------------------------------------
+st.set_page_config(page_title="Upload Data – AI Report", page_icon="📄")
+
+# ---------------------------------------------------------------------
+# Backend config
+# ---------------------------------------------------------------------
 BACKEND_URL = os.getenv(
     "BACKEND_URL",
-    "https://ai-report-backend-ubx.onrender.com"   # <- change if needed
+    "https://ai-report-backend-ubx.onrender.com"  # update if your URL changes
 )
-
-# -----------------------------------------------------------------------------
-# Streamlit Page Setup
-# -----------------------------------------------------------------------------
-st.set_page_config(page_title="Upload Data – AI Report", page_icon="📄")
 
 st.title("Upload Data & Generate a Business-Friendly Summary")
 st.write(
-    "Turn dense reports, meeting notes, and long documents into clear summaries."
+    "Turn dense reports, meeting notes, and long documents into clear, client-ready summaries."
 )
 
-# -----------------------------------------------------------------------------
-# Load the billing email saved on Billing page
-# -----------------------------------------------------------------------------
-if "billing_email" not in st.session_state:
-    st.session_state["billing_email"] = ""
-
-user_email = st.session_state["billing_email"]
-
-if not user_email:
-    st.warning(
-        "⚠️ Please enter your email on the **Billing** page first. "
-        "Your plan and limits are linked to your email."
-    )
-
+# ---------------------------------------------------------------------
+# Email used for billing & summarization
+# ---------------------------------------------------------------------
 st.subheader("Your email")
-st.text_input("Billing email (from Billing page):", value=user_email, disabled=True)
 
-# -----------------------------------------------------------------------------
-# File Upload + Text Input
-# -----------------------------------------------------------------------------
+# Get any email already stored from the Billing page
+saved_email = st.session_state.get("billing_email", "")
+
+email_input = st.text_input(
+    "Use the same email you subscribed with:",
+    value=saved_email,
+    placeholder="you@example.com",
+)
+
+# Keep session in sync so Billing & Upload share the same address
+if email_input:
+    st.session_state["billing_email"] = email_input
+
+if not email_input:
+    st.info("Enter your billing email above before generating a summary.")
+
+# ---------------------------------------------------------------------
+# Upload or paste content
+# ---------------------------------------------------------------------
 st.subheader("1. Add your content")
 
 uploaded_file = st.file_uploader(
@@ -52,59 +56,66 @@ uploaded_file = st.file_uploader(
 manual_text = st.text_area(
     "Or paste text manually",
     height=200,
-    placeholder="Paste meeting notes, reports, or any content..."
+    placeholder="Paste meeting notes, reports, or any free-text content…",
 )
 
 content_text = ""
 filename = "manual_input.txt"
 
-if uploaded_file:
+if uploaded_file is not None:
     filename = uploaded_file.name
     try:
         content_text = uploaded_file.read().decode("utf-8", errors="ignore")
-    except:
+    except Exception:
         content_text = ""
-
 elif manual_text.strip():
     content_text = manual_text.strip()
 
-# -----------------------------------------------------------------------------
-# Generate Summary Button
-# -----------------------------------------------------------------------------
+# ---------------------------------------------------------------------
+# Generate summary
+# ---------------------------------------------------------------------
 st.subheader("2. Generate a summary")
 
 if st.button("Generate Business Summary", type="primary"):
-
-    if not user_email:
-        st.error("Email missing. Please go to the Billing page and save your email first.")
+    # Basic validation
+    if not email_input:
+        st.error("Please enter the email you used at checkout.")
         st.stop()
 
     if not content_text:
-        st.error("Please upload a file or paste text before summarizing.")
+        st.error("Please upload a file or paste some text before summarizing.")
         st.stop()
 
     payload = {
-        "email": user_email,
+        "email": email_input,
         "text_content": content_text,
         "filename": filename,
         "num_chars": len(content_text),
     }
 
-    with st.spinner("Contacting the AI engine..."):
+    with st.spinner("Contacting the AI engine…"):
         try:
-            response = requests.post(
+            resp = requests.post(
                 f"{BACKEND_URL}/summarize",
                 json=payload,
                 timeout=120,
             )
-
-            response.raise_for_status()
-            data = response.json()
+            resp.raise_for_status()
+            data = resp.json()
 
             st.success("Summary generated successfully!")
-            st.write(data.get("summary", ""))
+            summary_text = data.get("summary", "")
+            if summary_text:
+                st.markdown("### Summary")
+                st.write(summary_text)
+            else:
+                st.warning("Backend responded without a 'summary' field.")
 
+        except requests.exceptions.RequestException as e:
+            st.error(f"Network or backend error: {e}")
         except Exception as e:
-            st.error(f"Backend error: {e}")
-            st.json(response.json() if 'response' in locals() else {})
-
+            st.error(f"Unexpected error: {e}")
+            try:
+                st.json(resp.json())
+            except Exception:
+                pass
