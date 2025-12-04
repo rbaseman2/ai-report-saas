@@ -10,7 +10,8 @@ import streamlit as st
 
 st.set_page_config(page_title="Billing & Subscription", page_icon="💳")
 
-BACKEND_URL = st.secrets.get("BACKEND_URL", os.getenv("BACKEND_URL", "http://localhost:8000"))
+# Use ONLY environment variable now – no st.secrets to avoid FileNotFoundError
+BACKEND_URL = os.getenv("BACKEND_URL", "http://localhost:8000")
 
 st.title("Billing & Subscription")
 st.write(
@@ -58,7 +59,6 @@ def fetch_plan(email: str):
             timeout=20,
         )
         if resp.status_code == 404:
-            # Treat as free if backend explicitly returns 404
             st.session_state["current_plan_info"] = {
                 "plan": "free",
                 "max_documents": 5,
@@ -125,7 +125,6 @@ def start_checkout(plan_slug: str):
         st.success(
             f"Redirecting you to Stripe Checkout for the **{plan_slug.capitalize()}** plan..."
         )
-        # Open in a new tab
         st.markdown(
             f"""
             <script>

@@ -1,15 +1,14 @@
 # pages/1_Upload_Data.py
 
 import os
-import io
-import textwrap
 
 import requests
 import streamlit as st
 
 st.set_page_config(page_title="Upload Data – AI Report", page_icon="📄")
 
-BACKEND_URL = st.secrets.get("BACKEND_URL", os.getenv("BACKEND_URL", "http://localhost:8000"))
+# Again: only environment variable, no st.secrets
+BACKEND_URL = os.getenv("BACKEND_URL", "http://localhost:8000")
 
 st.title("Upload Data & Generate a Business-Friendly Summary")
 st.write(
@@ -18,7 +17,7 @@ st.write(
 )
 
 # -------------------------------------------------------------------
-# 1. Your email (ties uploads to your subscription)
+# 1. Your email
 # -------------------------------------------------------------------
 
 st.subheader("Your email")
@@ -30,7 +29,6 @@ email = st.text_input(
     key="upload_email",
 )
 
-# Keep billing_email and upload_email in sync for convenience
 if email:
     st.session_state["billing_email"] = email
 
@@ -91,7 +89,6 @@ combined_text = ""
 
 
 def read_uploaded_text(file) -> str:
-    # For this version, we’ll just read as text and ignore PDFs/Docx parsing
     raw = file.read()
     try:
         return raw.decode("utf-8", errors="ignore")
@@ -107,7 +104,6 @@ if pasted_text.strip():
         combined_text += "\n\n"
     combined_text += pasted_text.strip()
 
-# Enforce max_chars on the client side as well
 max_chars = plan_info.get("max_chars", 200_000)
 if combined_text and len(combined_text) > max_chars:
     st.warning(
