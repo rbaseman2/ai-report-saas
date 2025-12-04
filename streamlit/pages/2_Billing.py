@@ -95,20 +95,22 @@ def start_checkout(email: str, plan: str):
             st.error("Backend did not return a checkout URL.")
             return
 
-        st.success("Checkout session created. Opening Stripe in a new tab…")
-        st.markdown(
-            f"""
-            <script>
-                window.open("{url}", "_blank");
-            </script>
-            If you are not redirected automatically, click
-            <a href="{url}" target="_blank">here to open Stripe Checkout</a>.
-            """,
-            unsafe_allow_html=True,
+        st.success("Checkout session created.")
+
+        # Store so we can show it elsewhere if we want
+        st.session_state["last_checkout_url"] = url
+
+        st.info(
+            "Click the button below to open Stripe Checkout in a new tab "
+            "and complete your purchase."
         )
+
+        # Button that opens Stripe checkout
+        st.link_button("Open Stripe Checkout", url, type="primary")
 
     except Exception as exc:
         st.error(f"Network error starting checkout: {exc}")
+
 
 
 # ---------- Page UI ----------
