@@ -175,21 +175,30 @@ async def create_checkout_session(req: CheckoutRequest):
 
     try:
         session = stripe.checkout.Session.create(
-            mode="subscription",
-            payment_method_types=["card"],
-            line_items=[
-                {
-                    "price": price_id,
-                    "quantity": 1,
-                }
-            ],
-            customer_email=email,
-            success_url=f"{SUCCESS_URL}?status=success&session_id={{CHECKOUT_SESSION_ID}}",
-            cancel_url=f"{CANCEL_URL}?status=cancelled",
-        )
-        return {"checkout_url": session.url}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+    mode="subscription",
+    customer_email=email,  # pre-fills email
+    line_items=[
+        {
+            "price": price_id,
+            "quantity": 1,
+        }
+    ],
+    # Where to send the user afterward
+    success_url=f"{FRONTEND_URL}/Billing?status=success&session_id={{CHECKOUT_SESSION_ID}}",
+    cancel_url=f"{FRONTEND_URL}/Billing?status=canceled",
+
+    # ✅ Show coupon / promo code box
+    allow_promotion_codes=True,
+
+    # (Optional but nice) collect billing address automatically
+    billing_address_collection="auto",
+
+    # (Optional) collect phone numbers
+    phone_number_collection={"enabled": True},
+
+    # (Optional) automatic tax calculation, if you’ve set it up in Stripe
+    # automatic_tax={"enabled": True},
+)
 
 
 @app.post("/summarize", response_model=SummarizeResponse)
