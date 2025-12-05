@@ -20,8 +20,9 @@ PRICE_BASIC_ID = os.getenv("PRICE_BASIC")        # e.g. price_123
 PRICE_PRO_ID = os.getenv("PRICE_PRO")            # e.g. price_456
 PRICE_ENTERPRISE_ID = os.getenv("PRICE_ENTERPRISE")
 
-SUCCESS_URL = os.getenv("SUCCESS_URL")           # front-end /Billing
-CANCEL_URL = os.getenv("CANCEL_URL")             # front-end /Billing
+# Frontend redirect URLs (you already set these on Render)
+SUCCESS_URL = os.getenv("SUCCESS_URL")           # e.g. https://ai-report-saas.onrender.com/Billing?status=success
+CANCEL_URL = os.getenv("CANCEL_URL")             # e.g. https://ai-report-saas.onrender.com/Billing?status=canceled
 
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 
@@ -44,7 +45,6 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
-
 
 # -------------------------------------------------------------------
 # Helpers
@@ -173,32 +173,41 @@ async def create_checkout_session(req: CheckoutRequest):
             detail=f"PRICE id not configured for plan {plan}.",
         )
 
+    if not SUCCESS_URL or not CANCEL_URL:
+        raise HTTPException(
+            status_code=500,
+            detail="SUCCESS_URL and CANCEL_URL must be set in the backend environment.",
+        )
+
     try:
+        # You can choose whether SUCCESS_URL already has query params.
+        # Here we just always append the session id as ?session_id=...
+        success_url = f"{SUCCESS_URL}&session_id={{CHECKOUT_SESSION_ID}}" if "?" in SUCCESS_URL \
+            else f"{SUCCESS_URL}?session_id={{CHECKOUT_SESSION_ID}}"
+
         session = stripe.checkout.Session.create(
-    mode="subscription",
-    customer_email=email,  # pre-fills email
-    line_items=[
-        {
-            "price": price_id,
-            "quantity": 1,
-        }
-    ],
-    # Where to send the user afterward
-    success_url=f"{FRONTEND_URL}/Billing?status=success&session_id={{CHECKOUT_SESSION_ID}}",
-    cancel_url=f"{FRONTEND_URL}/Billing?status=canceled",
+            mode="subscription",
+            customer_email=email,  # pre-fills email
+            line_items=[
+                {
+                    "price": price_id,
+                    "quantity": 1,
+                }
+            ],
+            success_url=success_url,
+            cancel_url=CANCEL_URL,
 
-    # ✅ Show coupon / promo code box
-    allow_promotion_codes=True,
+            # ✅ This shows the “Add promotion code” box
+            allow_promotion_codes=True,
 
-    # (Optional but nice) collect billing address automatically
-    billing_address_collection="auto",
+            # Optional nice-to-haves:
+            billing_address_collection="auto",
+            phone_number_collection={"enabled": True},
+        )
 
-    # (Optional) collect phone numbers
-    phone_number_collection={"enabled": True},
-
-    # (Optional) automatic tax calculation, if you’ve set it up in Stripe
-    # automatic_tax={"enabled": True},
-)
+        return {"checkout_url": session.url}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Stripe error: {e}")
 
 
 @app.post("/summarize", response_model=SummarizeResponse)
