@@ -1,45 +1,18 @@
-# server/webhook.py
-
 import os
-from typing import Optional
-
+import json
+import stripe
 from fastapi import FastAPI, HTTPException, Request, Header
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-import stripe
-from openai import OpenAI
-import requests  # <── NEW
+from typing import Optional
 
 # -------------------------------------------------------------------
-# Environment / config
+# FASTAPI APP
 # -------------------------------------------------------------------
-
-STRIPE_SECRET_KEY = os.getenv("STRIPE_SECRET_KEY")
-STRIPE_WEBHOOK_SECRET = os.getenv("STRIPE_WEBHOOK_SECRET")
-
-PRICE_BASIC_ID = os.getenv("PRICE_BASIC")
-PRICE_PRO_ID = os.getenv("PRICE_PRO")
-PRICE_ENTERPRISE_ID = os.getenv("PRICE_ENTERPRISE")
-
-SUCCESS_URL = os.getenv("SUCCESS_URL")
-CANCEL_URL = os.getenv("CANCEL_URL")
-
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-
-# NEW – email config
-SENDGRID_API_KEY = os.getenv("SENDGRID_API_KEY")
-FROM_EMAIL = os.getenv("FROM_EMAIL")
-
-if not STRIPE_SECRET_KEY:
-    raise RuntimeError("STRIPE_SECRET_KEY is not set")
-if not OPENAI_API_KEY:
-    raise RuntimeError("OPENAI_API_KEY is not set")
-
-stripe.api_key = STRIPE_SECRET_KEY
-openai_client = OpenAI(api_key=OPENAI_API_KEY)
 
 app = FastAPI()
 
+# Allow Streamlit frontend to connect
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -49,194 +22,177 @@ app.add_middleware(
 )
 
 # -------------------------------------------------------------------
-# Models & limits
+# HEALTH CHECK  (REQUIRED FOR RENDER)
+# -------------------------------------------------------------------
+@app.get("/health")
+async def health():
+    return {"status": "ok"}
+
+# -------------------------------------------------------------------
+# STRIPE CONFIG
 # -------------------------------------------------------------------
 
-class PlanLimits(BaseModel):
-    plan: str
-    max_documents: int
-    max_chars: int
+stripe.api_key = os.getenv("STRIPE_SECRET_KEY")
+WEBHOOK_SECRET = os.getenv("STRIPE_WEBHOOK_SECRET")
 
-DEFAULT_LIMITS = PlanLimits(plan="free", max_documents=5, max_chars=200_000)
-BASIC_LIMITS = PlanLimits(plan="basic", max_documents=20, max_chars=400_000)
-PRO_LIMITS = PlanLimits(plan="pro", max_documents=75, max_chars=1_500_000)
-ENTERPRISE_LIMITS = PlanLimits(plan="enterprise", max_documents=250, max_chars=5_000_000)
+PRICE_BASIC = os.getenv("PRICE_BASIC")
+PRICE_PRO = os.getenv("PRICE_PRO")
+PRICE_ENTERPRISE = os.getenv("PRICE_ENTERPRISE")
 
+SUCCESS_URL = os.getenv("SUCCESS_URL", "https://ai-report-saas.onrender.com/Billing")
+CANCEL_URL = os.getenv("CANCEL_URL", "https://ai-report-saas.onrender.com/Billing")
 
-def _map_price_to_limits(price_id: str) -> PlanLimits:
-    if price_id == PRICE_BASIC_ID:
-        return BASIC_LIMITS
-    if price_id == PRICE_PRO_ID:
-        return PRO_LIMITS
-    if price_id == PRICE_ENTERPRISE_ID:
-        return ENTERPRISE_LIMITS
-    return DEFAULT_LIMITS
-
-
-def get_limits_for_email(email: str) -> PlanLimits:
-    if not email:
-        return DEFAULT_LIMITS
-    try:
-        customers = stripe.Customer.list(email=email, limit=1)
-        if not customers.data:
-            return DEFAULT_LIMITS
-
-        customer = customers.data[0]
-        subs = stripe.Subscription.list(
-            customer=customer.id,
-            status="active",
-            limit=1,
-            expand=["data.items.data.price"],
-        )
-        if not subs.data:
-            return DEFAULT_LIMITS
-
-        sub = subs.data[0]
-        item = sub["items"]["data"][0]
-        price_id = item["price"]["id"]
-        return _map_price_to_limits(price_id)
-    except Exception:
-        return DEFAULT_LIMITS
-
+# -------------------------------------------------------------------
+# MODELS
+# -------------------------------------------------------------------
 
 class CheckoutRequest(BaseModel):
-    plan: str
     email: str
+    plan: str        # "basic", "pro", "enterprise"
+    coupon: Optional[str] = None
 
 
-class SummarizeRequest(BaseModel):
-    email: str           # subscriber’s/billing email
-    text: str           # content to summarize
-    send_to_email: Optional[str] = None  # <── NEW (client email)
-
-
-class SummarizeResponse(BaseModel):
-    summary: str
-    plan: str
-    max_chars: int
-    used_chars: int
+class SummaryRequest(BaseModel):
+    email: str
+    text: str
 
 
 # -------------------------------------------------------------------
-# Email helper
+# PRICING LOOKUP
 # -------------------------------------------------------------------
 
-def send_summary_email(to_email: str, summary: str, plan: str, used_chars: int):
-    """
-    Send the summary via SendGrid. Fail silently (log only) so the user
-    still gets the summary even if email breaks.
-    """
-    if not SENDGRID_API_KEY or not FROM_EMAIL:
-        # If email isn't configured, just skip
-        return
+PLAN_MAP = {
+    "basic": PRICE_BASIC,
+    "pro": PRICE_PRO,
+    "enterprise": PRICE_ENTERPRISE,
+}
 
-    subject = "Your AI-generated report summary"
-    text_body = (
-        "Hi,\n\n"
-        "Here is your AI-generated summary.\n\n"
-        f"Plan: {plan}\n"
-        f"Characters summarized: {used_chars}\n\n"
-        "Summary:\n\n"
-        f"{summary}\n\n"
-        "Best regards,\n"
-        "RobAlSolutions AI Report"
-    )
+# -------------------------------------------------------------------
+# CHECKOUT SESSION CREATION
+# -------------------------------------------------------------------
 
-    html_body = f"""
-    <p>Hi,</p>
-    <p>Here is your AI-generated summary.</p>
-    <p><b>Plan:</b> {plan}<br>
-       <b>Characters summarized:</b> {used_chars}</p>
-    <p><b>Summary:</b></p>
-    <pre style="white-space:pre-wrap;font-family:system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;">
-{summary}
-    </pre>
-    <p>Best regards,<br>RobAlSolutions AI Report</p>
-    """
+@app.post("/create-checkout-session")
+async def create_checkout_session(data: CheckoutRequest):
+    if data.plan not in PLAN_MAP:
+        raise HTTPException(status_code=400, detail="Invalid plan")
 
-    payload = {
-        "personalizations": [
-            {"to": [{"email": to_email}], "subject": subject}
-        ],
-        "from": {"email": FROM_EMAIL, "name": "AI Report"},
-        "content": [
-            {"type": "text/plain", "value": text_body},
-            {"type": "text/html", "value": html_body},
-        ],
-    }
-
-    headers = {
-        "Authorization": f"Bearer {SENDGRID_API_KEY}",
-        "Content-Type": "application/json",
-    }
+    price_id = PLAN_MAP[data.plan]
 
     try:
-        requests.post(
-            "https://api.sendgrid.com/v3/mail/send",
-            headers=headers,
-            json=payload,
-            timeout=10,
-        )
-    except Exception:
-        # You could log this to stdout; Render will capture it
-        pass
+        params = {
+            "customer_email": data.email,
+            "line_items": [{"price": price_id, "quantity": 1}],
+            "mode": "subscription",
+            "success_url": SUCCESS_URL,
+            "cancel_url": CANCEL_URL,
+        }
 
+        # Optional coupon support
+        if data.coupon:
+            params["discounts"] = [{"coupon": data.coupon}]
 
-# -------------------------------------------------------------------
-# Endpoints (health, subscription, checkout) unchanged… 
-# (keep your existing ones here)
-# -------------------------------------------------------------------
+        session = stripe.checkout.Session.create(**params)
 
-@app.post("/summarize", response_model=SummarizeResponse)
-async def summarize(req: SummarizeRequest):
-    email = req.email.strip()
-    if not email:
-        raise HTTPException(status_code=400, detail="Email is required")
+        return {"checkout_url": session.url}
 
-    limits = get_limits_for_email(email)
-    max_chars = limits.max_chars
-
-    HARD_CAP = 60_000
-    effective_cap = min(max_chars, HARD_CAP)
-    text = req.text[:effective_cap]
-    used = len(text)
-
-    if used == 0:
-        raise HTTPException(status_code=400, detail="No text provided")
-
-    try:
-        completion = openai_client.chat.completions.create(
-            model="gpt-4o-mini",
-            messages=[
-                {
-                    "role": "system",
-                    "content": (
-                        "You are an AI assistant that turns long, dense reports into a "
-                        "concise, business-friendly summary for executives and stakeholders. "
-                        "Highlight key points, risks, action items, and recommendations."
-                    ),
-                },
-                {"role": "user", "content": text},
-            ],
-            temperature=0.4,
-        )
-
-        summary = completion.choices[0].message.content.strip()
-
-        # NEW – email summary to client if requested
-        if req.send_to_email:
-            send_summary_email(
-                to_email=req.send_to_email.strip(),
-                summary=summary,
-                plan=limits.plan,
-                used_chars=used,
-            )
-
-        return SummarizeResponse(
-            summary=summary,
-            plan=limits.plan,
-            max_chars=max_chars,
-            used_chars=used,
-        )
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+
+# -------------------------------------------------------------------
+# SUBSCRIPTION STATUS
+# -------------------------------------------------------------------
+
+@app.get("/subscription-status")
+async def subscription_status(email: str):
+    try:
+        customers = stripe.Customer.list(email=email).data
+
+        if not customers:
+            return {"active": False, "plan": "free"}
+
+        customer = customers[0]
+
+        subs = stripe.Subscription.list(customer=customer.id, status="active").data
+
+        if not subs:
+            return {"active": False, "plan": "free"}
+
+        sub = subs[0]
+        plan_lookup = {
+            PRICE_BASIC: "basic",
+            PRICE_PRO: "pro",
+            PRICE_ENTERPRISE: "enterprise",
+        }
+
+        plan_id = sub.items.data[0].price.id
+        plan_name = plan_lookup.get(plan_id, "free")
+
+        # Set limits per plan
+        limits = {
+            "basic": {"max_documents": 20, "max_chars": 400000},
+            "pro": {"max_documents": 75, "max_chars": 1500000},
+            "enterprise": {"max_documents": 250, "max_chars": 5000000},
+        }.get(plan_name, {"max_documents": 5, "max_chars": 200000})
+
+        return {
+            "active": True,
+            "plan": plan_name,
+            "max_documents": limits["max_documents"],
+            "max_chars": limits["max_chars"],
+        }
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# -------------------------------------------------------------------
+# STRIPE WEBHOOK HANDLER
+# -------------------------------------------------------------------
+
+@app.post("/webhook")
+async def stripe_webhook(
+    request: Request,
+    stripe_signature: Optional[str] = Header(None)
+):
+    payload = await request.body()
+
+    if not WEBHOOK_SECRET:
+        raise HTTPException(status_code=500, detail="Webhook secret missing")
+
+    try:
+        event = stripe.Webhook.construct_event(
+            payload, stripe_signature, WEBHOOK_SECRET
+        )
+    except stripe.error.SignatureVerificationError:
+        raise HTTPException(status_code=400, detail="Invalid signature")
+
+    # Handle subscription events
+    if event["type"] == "customer.subscription.created":
+        print("Subscription created:", event["data"]["object"]["id"])
+
+    elif event["type"] == "customer.subscription.updated":
+        print("Subscription updated:", event["data"]["object"]["id"])
+
+    elif event["type"] == "customer.subscription.deleted":
+        print("Subscription canceled:", event["data"]["object"]["id"])
+
+    return {"status": "success"}
+
+
+# -------------------------------------------------------------------
+# TEXT SUMMARY ENDPOINT
+# -------------------------------------------------------------------
+
+@app.post("/summarize")
+async def summarize_text(data: SummaryRequest):
+    if not data.email:
+        raise HTTPException(status_code=422, detail="Missing email")
+
+    if not data.text:
+        raise HTTPException(status_code=422, detail="Missing text to summarize")
+
+    # --- AI SUMMARY (replace with your OpenAI model call) ---
+    summary = f"Summary:\n\n{data.text[:500]}\n\n...(trimmed)..."
+
+    return {"summary": summary}
