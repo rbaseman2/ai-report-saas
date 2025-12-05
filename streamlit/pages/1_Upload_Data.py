@@ -1,9 +1,18 @@
 import streamlit as st
 import requests
 import os
-import pdfplumber
-import docx2txt
 import io
+
+# Optional imports – we won't crash if they're missing
+try:
+    import pdfplumber
+except ImportError:
+    pdfplumber = None
+
+try:
+    import docx2txt
+except ImportError:
+    docx2txt = None
 
 st.set_page_config(page_title="Upload Data – AI Report")
 
@@ -18,22 +27,40 @@ st.title("Upload Data & Generate a Business-Friendly Summary")
 def extract_text_from_file(file):
     name = file.name.lower()
 
-    if name.endswith(".txt"):
-        return file.read().decode("utf-8")
+    # Plain text / markdown / csv: just decode
+    if name.endswith((".txt", ".md", ".csv")):
+        try:
+            return file.read().decode("utf-8", errors="ignore")
+        except Exception:
+            return ""
 
-    if name.endswith(".md"):
-        return file.read().decode("utf-8")
-
+    # PDF via pdfplumber (if available)
     if name.endswith(".pdf"):
-        with pdfplumber.open(io.BytesIO(file.read())) as pdf:
-            return "\n".join(page.extract_text() or "" for page in pdf.pages)
+        if pdfplumber is None:
+            st.warning("PDF support requires the 'pdfplumber' package. "
+                       "Ask your dev (you 🙂) to add 'pdfplumber' to requirements.txt.")
+            return ""
+        try:
+            with pdfplumber.open(io.BytesIO(file.read())) as pdf:
+                return "\n".join(page.extract_text() or "" for page in pdf.pages)
+        except Exception as e:
+            st.error(f"Error reading PDF: {e}")
+            return ""
 
+    # DOCX via docx2txt (if available)
     if name.endswith(".docx"):
-        return docx2txt.process(file)
+        if docx2txt is None:
+            st.warning("DOCX support requires the 'docx2txt' package. "
+                       "Add 'docx2txt' to requirements.txt.")
+            return ""
+        try:
+            return docx2txt.process(file)
+        except Exception as e:
+            st.error(f"Error reading DOCX: {e}")
+            return ""
 
-    if name.endswith(".csv"):
-        return file.read().decode("utf-8")
-
+    # Fallback
+    st.warning(f"Unsupported file type for: {file.name}")
     return ""
 
 
@@ -41,7 +68,11 @@ def extract_text_from_file(file):
 # Email input (required by backend for entitlement)
 # -------------------------------------------------------------------
 
-email = st.text_input("Your email", placeholder="Enter the same email you subscribed with")
+email = st.text_input(
+    "Your email",
+    placeholder="Enter the same email you subscribed with",
+    help="Use the same email you used at checkout so your plan & limits match."
+)
 
 st.markdown("---")
 
@@ -99,8 +130,8 @@ if st.button("Generate Business Summary"):
         "recipient_email": recipient_email,
     }
 
-    # Debug
-    st.write("Sending payload to backend:", payload)
+    # Optional debug
+    # st.json(payload)
 
     try:
         response = requests.post(f"{BACKEND_URL}/summarize", json=payload, timeout=300)
