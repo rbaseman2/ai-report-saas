@@ -136,4 +136,32 @@ def send_summary_email(to_email: str, body: str, original_email: str):
 
     payload = {
         "sender": {"email": EMAIL_FROM},
-        "to": [{"emai]()
+        "to": [{"email": to_email}],
+        "replyTo": {"email": original_email},
+        "subject": "Your AI-generated summary",
+        "textContent": body,
+    }
+
+    try:
+        resp = requests.post(
+            "https://api.brevo.com/v3/smtp/email",
+            json=payload,
+            headers={
+                "api-key": BREVO_API_KEY,
+                "Content-Type": "application/json",
+                "accept": "application/json",
+            },
+            timeout=10,
+        )
+
+        if resp.status_code >= 400:
+            logger.error(
+                "Brevo email failed: status=%s body=%s",
+                resp.status_code,
+                resp.text,
+            )
+        else:
+            logger.info("Brevo email sent successfully: %s", resp.text)
+
+    except Exception as e:
+        logger.exception("Failed to send summary email via Brevo: %s", e)
