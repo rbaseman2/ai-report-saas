@@ -59,10 +59,10 @@ app.add_middleware(
 
 
 class SummarizeRequest(BaseModel):
-    email: EmailStr
-    text: str
-    send_email: bool = False
-    recipient_email: Optional[EmailStr] = None
+    email: EmailStr                # billing / user email
+    text: str                      # content to summarize
+    send_email: bool = False       # whether to email summary to someone
+    recipient_email: Optional[EmailStr] = None  # optional recipient
 
 
 class CheckoutRequest(BaseModel):
@@ -82,18 +82,22 @@ class WebhookEvent(BaseModel):
 
 
 def generate_summary(text: str) -> str:
+    """
+    Wrapper around OpenAI to generate a business-style summary.
+    """
     if not OPENAI_API_KEY:
         logger.error("OPENAI_API_KEY not set – returning fallback summary.")
         return "Summary service is temporarily unavailable. Please try again later."
 
     try:
         from openai import OpenAI
+
         client = OpenAI(api_key=OPENAI_API_KEY)
 
         prompt = (
             "You are an assistant that writes concise, business-friendly summaries. "
-            "Summarize the following content for busy professionals, focusing on "
-            "key points, risks, opportunities, and recommended actions.\n\n"
+            "Summarize the following content for busy professionals, focusing on key "
+            "points, risks, opportunities, and recommended actions.\n\n"
             f"CONTENT:\n{text}"
         )
 
@@ -120,7 +124,8 @@ def generate_summary(text: str) -> str:
 
 def send_summary_email(to_email: str, body: str, original_email: str):
     """
-    Send the summary email via Brevo Transactional Email API.
+    Send the summary email via Brevo (Sendinblue) transactional API.
+    Failures are logged but do not crash the request.
     """
     if not BREVO_API_KEY:
         logger.error("BREVO_API_KEY is not set – cannot send email.")
@@ -150,7 +155,7 @@ def send_summary_email(to_email: str, body: str, original_email: str):
             logger.error(
                 "Brevo email failed: status=%s body=%s",
                 resp.status_code,
-                resp.text
+                resp.text,
             )
         else:
             logger.info("Brevo email sent successfully: %s", resp.text)
@@ -166,17 +171,24 @@ def send_summary_email(to_email: str, body: str, original_email: str):
 
 @app.post("/summarize")
 async def summarize(req: SummarizeRequest):
+    """
+    Generate a summary and optionally email it.
+    """
     if not req.text.strip():
         raise HTTPException(status_code=400, detail="Text to summarize is required.")
 
     summary = generate_summary(req.text)
 
     if req.send_email and req.recipient_email:
-        send_summary_email(
-            to_email=req.recipient_email,
-            body=summary,
-            original_email=req.email,
-        )
+        # Email failures are logged but won't break the API response
+        try:
+            send_summary_email(
+                to_email=req.recipient_email,
+                body=summary,
+                original_email=req.email,
+            )
+        except Exception:
+            logger.exception("Error while trying to send summary email.")
 
     return {"summary": summary}
 
@@ -208,15 +220,17 @@ async def create_checkout_session(data: CheckoutRequest):
         checkout_session = stripe.checkout.Session.create(
             payment_method_types=["card"],
             mode="subscription",
-            line_items=[{"price": price_id, "quantity": 1}],
+            line_items=[
+                {
+                    "price": price_id,
+                    "quantity": 1,
+                }
+            ],
             customer_email=str(data.email),
             success_url=SUCCESS_URL,
             cancel_url=CANCEL_URL,
         )
-        return {
-            "sessionId": checkout_session["id"],
-            "url": checkout_session["url"],
-        }
+        return {"sessionId": checkout_session["id"], "url": checkout_session["url"]}
     except Exception as e:
         logger.exception("Error creating Stripe Checkout Session: %s", e)
         raise HTTPException(
@@ -227,10 +241,14 @@ async def create_checkout_session(data: CheckoutRequest):
 
 @app.post("/stripe-webhook")
 async def stripe_webhook(request: Request):
+    """
+    Stripe webhook handler.
+    """
     payload = await request.body()
     sig_header = request.headers.get("stripe-signature")
 
     if not STRIPE_WEBHOOK_SECRET:
+        logger.error("STRIPE_WEBHOOK_SECRET is not set on the server.")
         raise HTTPException(status_code=500, detail="Webhook secret is not configured.")
 
     try:
@@ -239,11 +257,21 @@ async def stripe_webhook(request: Request):
             sig_header=sig_header,
             secret=STRIPE_WEBHOOK_SECRET,
         )
-    except ValueError:
+    except ValueError as e:
+        logger.error("Invalid payload: %s", e)
         raise HTTPException(status_code=400, detail="Invalid payload")
-    except stripe.error.SignatureVerificationError:
+    except stripe.error.SignatureVerificationError as e:
+        logger.error("Invalid signature: %s", e)
         raise HTTPException(status_code=400, detail="Invalid signature")
 
     logger.info("Received Stripe event: %s", event["type"])
 
     return {"received": True}
+
+
+@app.get("/health")
+async def health():
+    """
+    Simple health check endpoint for Render.
+    """
+    return {"status": "ok"}
