@@ -23,8 +23,10 @@ PRICE_BASIC = os.getenv("PRICE_BASIC")
 PRICE_PRO = os.getenv("PRICE_PRO")
 PRICE_ENTERPRISE = os.getenv("PRICE_ENTERPRISE")
 
-SUCCESS_URL = os.getenv("SUCCESS_URL", "https://example.com/success")
-CANCEL_URL = os.getenv("CANCEL_URL", "https://example.com/cancel")
+SUCCESS_URL = "https://ai-report-saas.onrender.com/Billing?success=true"
+CANCEL_URL = "https://ai-report-saas.onrender.com/Billing?cancel=true"
+
+
 
 FRONTEND_URL = os.getenv("FRONTEND_URL", "https://ai-report-saas.onrender.com")
 
