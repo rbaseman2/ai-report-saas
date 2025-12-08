@@ -2,278 +2,222 @@ import os
 import logging
 from typing import Optional
 
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import FastAPI, HTTPException, Request, Header
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, EmailStr
-
 import stripe
-import requests
 
-# -------------------------------------------------------------------
-# Environment / configuration
-# -------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# Config & setup
+# ---------------------------------------------------------------------------
 
+logger = logging.getLogger("server.webhook")
 logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
 
 STRIPE_SECRET_KEY = os.getenv("STRIPE_SECRET_KEY")
-STRIPE_WEBHOOK_SECRET = os.getenv("STRIPE_WEBHOOK_SECRET")
+WEBHOOK_SECRET = os.getenv("STRIPE_WEBHOOK_SECRET")
+
+FRONTEND_URL = os.getenv("FRONTEND_URL", "https://ai-report-saas.onrender.com")
+SUCCESS_URL = os.getenv(
+    "SUCCESS_URL",
+    f"{FRONTEND_URL}/Billing?status=success",
+)
+CANCEL_URL = f"{FRONTEND_URL}/Billing?status=cancelled"
 
 PRICE_BASIC = os.getenv("PRICE_BASIC")
 PRICE_PRO = os.getenv("PRICE_PRO")
 PRICE_ENTERPRISE = os.getenv("PRICE_ENTERPRISE")
 
-SUCCESS_URL = "https://ai-report-saas.onrender.com/Billing?success=true"
-CANCEL_URL = "https://ai-report-saas.onrender.com/Billing?cancel=true"
-
-
-
-FRONTEND_URL = os.getenv("FRONTEND_URL", "https://ai-report-saas.onrender.com")
-
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-
-# Email / Brevo
-BREVO_API_KEY = os.getenv("BREVO_API_KEY")
-EMAIL_FROM = os.getenv("EMAIL_FROM", "rbaseman2@yahoo.com")
-
-if STRIPE_SECRET_KEY:
-    stripe.api_key = STRIPE_SECRET_KEY
-else:
+if not STRIPE_SECRET_KEY:
     logger.warning("STRIPE_SECRET_KEY is not set – Stripe calls will fail.")
+else:
+    stripe.api_key = STRIPE_SECRET_KEY
 
-# -------------------------------------------------------------------
-# FastAPI app + CORS
-# -------------------------------------------------------------------
+price_map = {
+    "basic": PRICE_BASIC,
+    "pro": PRICE_PRO,
+    "enterprise": PRICE_ENTERPRISE,
+}
 
-app = FastAPI(title="AI Report Backend")
+# ---------------------------------------------------------------------------
+# FastAPI app
+# ---------------------------------------------------------------------------
+
+app = FastAPI()
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[FRONTEND_URL, "http://localhost:8501", "http://127.0.0.1:8501", "*"],
+    allow_origins=[
+        FRONTEND_URL,
+        FRONTEND_URL.replace("https://", "http://"),
+    ],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# -------------------------------------------------------------------
-# Pydantic models
-# -------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# Models
+# ---------------------------------------------------------------------------
 
-
-class SummarizeRequest(BaseModel):
-    email: EmailStr                # billing / user email
-    text: str                      # content to summarize
-    send_email: bool = False       # whether to email summary to someone
-    recipient_email: Optional[EmailStr] = None  # optional recipient
-
-
-class CheckoutRequest(BaseModel):
+class CheckoutSessionRequest(BaseModel):
+    plan: str                # "basic" | "pro" | "enterprise"
     email: EmailStr
-    plan: str  # "basic" | "pro" | "enterprise"
+    coupon: Optional[str] = None
 
 
-class WebhookEvent(BaseModel):
-    id: str
-    type: str
-    data: dict
+class SubscriptionStatusResponse(BaseModel):
+    status: str              # "free" | "active"
+    plan: Optional[str] = None   # "basic" | "pro" | "enterprise" | None
 
 
-# -------------------------------------------------------------------
-# Helpers: OpenAI summary
-# -------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# Endpoints
+# ---------------------------------------------------------------------------
 
-
-def generate_summary(text: str) -> str:
-    """
-    Wrapper around OpenAI to generate a business-style summary.
-    """
-    if not OPENAI_API_KEY:
-        logger.error("OPENAI_API_KEY not set – returning fallback summary.")
-        return "Summary service is temporarily unavailable. Please try again later."
-
-    try:
-        from openai import OpenAI
-
-        client = OpenAI(api_key=OPENAI_API_KEY)
-
-        prompt = (
-            "You are an assistant that writes concise, business-friendly summaries. "
-            "Summarize the following content for busy professionals, focusing on key "
-            "points, risks, opportunities, and recommended actions.\n\n"
-            f"CONTENT:\n{text}"
-        )
-
-        completion = client.chat.completions.create(
-            model="gpt-4o-mini",
-            messages=[
-                {"role": "system", "content": "You write clear business summaries."},
-                {"role": "user", "content": prompt},
-            ],
-            max_tokens=800,
-        )
-
-        return completion.choices[0].message.content.strip()
-
-    except Exception as e:
-        logger.exception("Error while calling OpenAI: %s", e)
-        return "There was an error generating the summary. Please try again later."
-
-
-# -------------------------------------------------------------------
-# Helpers: Email via Brevo
-# -------------------------------------------------------------------
-
-
-def send_summary_email(to_email: str, body: str, original_email: str):
-    """
-    Send the summary email via Brevo (Sendinblue) transactional API.
-    Failures are logged but do not crash the request.
-    """
-    if not BREVO_API_KEY:
-        logger.error("BREVO_API_KEY is not set – cannot send email.")
-        return
-
-    payload = {
-        "sender": {"email": EMAIL_FROM},
-        "to": [{"email": to_email}],
-        "replyTo": {"email": original_email},
-        "subject": "Your AI-generated summary",
-        "textContent": body,
-    }
-
-    try:
-        resp = requests.post(
-            "https://api.brevo.com/v3/smtp/email",
-            json=payload,
-            headers={
-                "api-key": BREVO_API_KEY,
-                "Content-Type": "application/json",
-                "accept": "application/json",
-            },
-            timeout=10,
-        )
-
-        if resp.status_code >= 400:
-            logger.error(
-                "Brevo email failed: status=%s body=%s",
-                resp.status_code,
-                resp.text,
-            )
-        else:
-            logger.info("Brevo email sent successfully: %s", resp.text)
-
-    except Exception as e:
-        logger.exception("Failed to send summary email via Brevo: %s", e)
-
-
-# -------------------------------------------------------------------
-# Routes
-# -------------------------------------------------------------------
-
-
-@app.post("/summarize")
-async def summarize(req: SummarizeRequest):
-    """
-    Generate a summary and optionally email it.
-    """
-    if not req.text.strip():
-        raise HTTPException(status_code=400, detail="Text to summarize is required.")
-
-    summary = generate_summary(req.text)
-
-    if req.send_email and req.recipient_email:
-        # Email failures are logged but won't break the API response
-        try:
-            send_summary_email(
-                to_email=req.recipient_email,
-                body=summary,
-                original_email=req.email,
-            )
-        except Exception:
-            logger.exception("Error while trying to send summary email.")
-
-    return {"summary": summary}
-
-
-def price_for_plan(plan: str) -> str:
-    plan = plan.lower()
-    if plan == "basic":
-        return PRICE_BASIC
-    if plan == "pro":
-        return PRICE_PRO
-    if plan == "enterprise":
-        return PRICE_ENTERPRISE
-    return None
+@app.get("/health")
+async def health():
+    return {"status": "ok"}
 
 
 @app.post("/create-checkout-session")
-async def create_checkout_session(data: CheckoutRequest):
-    if not STRIPE_SECRET_KEY:
-        raise HTTPException(
-            status_code=500,
-            detail="Stripe secret key not configured on the server.",
-        )
+async def create_checkout_session(data: CheckoutSessionRequest):
+    """
+    Creates a Stripe Checkout Session and returns the URL.
 
-    price_id = price_for_plan(data.plan)
-    if not price_id:
-        raise HTTPException(status_code=400, detail="Invalid plan selected.")
+    IMPORTANT: The frontend expects a JSON response like:
+      { "checkout_url": "https://checkout.stripe.com/..." }
+    """
+    if not STRIPE_SECRET_KEY:
+        raise HTTPException(status_code=500, detail="Stripe is not configured")
+
+    plan_key = data.plan.lower()
+    if plan_key not in price_map or not price_map[plan_key]:
+        raise HTTPException(status_code=400, detail="Invalid plan")
+
+    price_id = price_map[plan_key]
 
     try:
-        checkout_session = stripe.checkout.Session.create(
-            payment_method_types=["card"],
-            mode="subscription",
-            line_items=[
-                {
-                    "price": price_id,
-                    "quantity": 1,
-                }
-            ],
-            customer_email=str(data.email),
-            success_url=SUCCESS_URL,
-            cancel_url=CANCEL_URL,
+        params = {
+            "mode": "subscription",
+            "customer_email": data.email,
+            "line_items": [{"price": price_id, "quantity": 1}],
+            "success_url": SUCCESS_URL,
+            "cancel_url": CANCEL_URL,
+        }
+
+        if data.coupon:
+            params["discounts"] = [{"coupon": data.coupon}]
+
+        session = stripe.checkout.Session.create(**params)
+        logger.info(
+            "Created checkout session %s for %s (%s)",
+            session.id,
+            data.email,
+            plan_key,
         )
-        return {"sessionId": checkout_session["id"], "url": checkout_session["url"]}
+
+        # 🔴 This field name must match what the frontend expects
+        return {"checkout_url": session.url}
+
+    except stripe.error.StripeError as e:
+        logger.exception("Stripe error while creating checkout session: %s", e)
+        raise HTTPException(status_code=502, detail="Stripe error")
     except Exception as e:
-        logger.exception("Error creating Stripe Checkout Session: %s", e)
-        raise HTTPException(
-            status_code=500,
-            detail="Error creating checkout session. Please try again later.",
+        logger.exception("Unexpected error while creating checkout session: %s", e)
+        raise HTTPException(status_code=500, detail="Failed to create checkout session")
+
+
+@app.get("/subscription-status", response_model=SubscriptionStatusResponse)
+async def subscription_status(email: EmailStr):
+    """
+    Returns the current subscription status for a given email,
+    based directly on Stripe data.
+    """
+    if not STRIPE_SECRET_KEY:
+        # If Stripe is not configured, just act like everyone is on free
+        return SubscriptionStatusResponse(status="free", plan=None)
+
+    try:
+        # 1) Find Stripe customer by email
+        customers = stripe.Customer.list(email=email, limit=1)
+        if not customers.data:
+            return SubscriptionStatusResponse(status="free", plan=None)
+
+        customer = customers.data[0]
+
+        # 2) Look for an active subscription
+        subs = stripe.Subscription.list(
+            customer=customer.id,
+            status="active",
+            limit=1,
         )
 
+        if not subs.data:
+            return SubscriptionStatusResponse(status="free", plan=None)
 
-@app.post("/stripe-webhook")
-async def stripe_webhook(request: Request):
+        sub = subs.data[0]
+        price_id = sub["items"]["data"][0]["price"]["id"]
+
+        # 3) Reverse map price ID -> plan name
+        plan = None
+        for key, pid in price_map.items():
+            if pid == price_id:
+                plan = key
+                break
+
+        return SubscriptionStatusResponse(status="active", plan=plan)
+
+    except stripe.error.StripeError as e:
+        logger.exception("Stripe error checking subscription status: %s", e)
+        # Fallback to "free" so the UI still works
+        return SubscriptionStatusResponse(status="free", plan=None)
+    except Exception as e:
+        logger.exception("Unexpected error checking subscription status: %s", e)
+        return SubscriptionStatusResponse(status="free", plan=None)
+
+
+@app.post("/webhook")
+async def stripe_webhook(
+    request: Request,
+    stripe_signature: str = Header(None, alias="Stripe-Signature"),
+):
     """
-    Stripe webhook handler.
+    Stripe webhook endpoint.
+
+    Make sure STRIPE_WEBHOOK_SECRET in Render matches the signing secret
+    from your Stripe dashboard for this endpoint.
     """
+    if not WEBHOOK_SECRET:
+        logger.warning("Received webhook but STRIPE_WEBHOOK_SECRET is not set")
+        raise HTTPException(status_code=500, detail="Webhook not configured")
+
     payload = await request.body()
-    sig_header = request.headers.get("stripe-signature")
-
-    if not STRIPE_WEBHOOK_SECRET:
-        logger.error("STRIPE_WEBHOOK_SECRET is not set on the server.")
-        raise HTTPException(status_code=500, detail="Webhook secret is not configured.")
+    sig_header = stripe_signature
 
     try:
         event = stripe.Webhook.construct_event(
             payload=payload,
             sig_header=sig_header,
-            secret=STRIPE_WEBHOOK_SECRET,
+            secret=WEBHOOK_SECRET,
         )
-    except ValueError as e:
-        logger.error("Invalid payload: %s", e)
+    except ValueError:
+        logger.exception("Invalid payload in Stripe webhook")
         raise HTTPException(status_code=400, detail="Invalid payload")
-    except stripe.error.SignatureVerificationError as e:
-        logger.error("Invalid signature: %s", e)
+    except stripe.error.SignatureVerificationError:
+        logger.exception("Invalid signature in Stripe webhook")
         raise HTTPException(status_code=400, detail="Invalid signature")
 
-    logger.info("Received Stripe event: %s", event["type"])
+    # Handle the events you care about
+    if event["type"] == "checkout.session.completed":
+        session = event["data"]["object"]
+        logger.info("Checkout session completed: %s", session.get("id"))
+        # TODO: add any post-checkout logic you want here.
 
+    elif event["type"] == "customer.subscription.deleted":
+        sub = event["data"]["object"]
+        logger.info("Subscription cancelled: %s", sub.get("id"))
+        # TODO: update your records if you store subscriptions.
+
+    # Always respond 200 so Stripe knows we received the event
     return {"received": True}
-
-
-@app.get("/health")
-async def health():
-    """
-    Simple health check endpoint for Render.
-    """
-    return {"status": "ok"}
