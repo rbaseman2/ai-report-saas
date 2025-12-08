@@ -98,13 +98,15 @@ async def create_checkout_session(data: CheckoutSessionRequest):
     price_id = price_map[plan_key]
 
     try:
-        params = {
-            "mode": "subscription",
-            "customer_email": data.email,
-            "line_items": [{"price": price_id, "quantity": 1}],
-            "success_url": SUCCESS_URL,
-            "cancel_url": CANCEL_URL,
-        }
+     params = {
+    "mode": "subscription",
+    "customer_email": data.email,
+    "line_items": [{"price": price_id, "quantity": 1}],
+    "success_url": SUCCESS_URL,
+    "cancel_url": CANCEL_URL,
+    "allow_promotion_codes": True,  # 👈 this brings back the coupon box
+}
+
 
         if data.coupon:
             params["discounts"] = [{"coupon": data.coupon}]
