@@ -35,7 +35,7 @@ PLAN_TO_PRICE = {
 class CheckoutRequest(BaseModel):
     plan: str          # "basic", "pro", or "enterprise"
     email: EmailStr
-    coupon: str | None = None   # optional coupon code from Billing page
+    coupon: str | None = None   # optional, but we IGNORE it now to avoid Stripe conflict
 
 
 # ----- FastAPI app setup -----
@@ -75,19 +75,19 @@ async def create_checkout_session(data: CheckoutRequest):
     if not price_id:
         raise HTTPException(status_code=400, detail="Invalid plan selected")
 
+    # IMPORTANT: only allow_promotion_codes, no discounts[]
     session_params: dict = {
         "mode": "subscription",
         "customer_email": data.email,
         "line_items": [{"price": price_id, "quantity": 1}],
-        # This makes Stripe show the “Add promotion code” box on the checkout page
+        # This shows the "Add promotion code" box on Stripe Checkout
         "allow_promotion_codes": True,
         "success_url": SUCCESS_URL + "?session_id={CHECKOUT_SESSION_ID}",
         "cancel_url": CANCEL_URL,
     }
 
-    # If you want to apply a specific coupon coming from your Billing page
-    if data.coupon:
-        session_params["discounts"] = [{"coupon": data.coupon}]
+    # We intentionally DO NOT set "discounts" here to avoid:
+    # "You may only specify one of these parameters: allow_promotion_codes, discounts"
 
     try:
         session = stripe.checkout.Session.create(**session_params)
@@ -125,7 +125,7 @@ async def subscription_status(email: str):
         if not active_sub:
             return {"has_active_subscription": False}
 
-        # Use .get() to avoid the KeyError you saw earlier
+        # Use .get() to avoid KeyError on current_period_end
         current_period_end = active_sub.get("current_period_end")
         cancel_at_period_end = active_sub.get("cancel_at_period_end", False)
 
@@ -148,7 +148,7 @@ async def subscription_status(email: str):
         raise HTTPException(status_code=500, detail=str(e))
 
 
-# ----- Stripe webhook (minimal, mostly to keep Stripe happy) -----
+# ----- Stripe webhook (minimal) -----
 
 
 @app.post("/webhook")
@@ -164,9 +164,8 @@ async def stripe_webhook(request: Request):
         except stripe.error.SignatureVerificationError:
             raise HTTPException(status_code=400, detail="Invalid signature")
     else:
-        # Fallback: no signature verification (OK for now, not ideal for prod)
+        # Fallback: no signature verification (ok for now)
         event = json.loads(payload.decode("utf-8"))
 
-    # You can add specific handling here (e.g. customer.subscription.created)
-    # For now we just acknowledge the event.
+    # You can add specific handling (subscription created/updated, etc.)
     return {"received": True}
