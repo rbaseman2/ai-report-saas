@@ -6,7 +6,8 @@ import streamlit as st
 # Config
 # -------------------------------------------------------------------
 
-BACKEND_URL = st.secrets.get("BACKEND_URL", "https://ai-report-backend-ubrx.onrender.com")
+# Use environment variable if set; otherwise fall back to your backend URL
+BACKEND_URL = os.getenv("BACKEND_URL", "https://ai-report-backend-ubrx.onrender.com")
 
 PLANS = {
     "basic": {
