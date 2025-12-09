@@ -1,158 +1,177 @@
-import os
 import logging
-from typing import Dict
+import os
+from typing import Optional
 
-from fastapi import FastAPI, HTTPException, Request
-from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, EmailStr
 import stripe
+from fastapi import FastAPI, Header, HTTPException, Request
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
 
-logger = logging.getLogger("webhook")
-logging.basicConfig(level=logging.INFO)
-
-# ---------- Stripe / environment config ----------
-
+# ----- Stripe configuration -----
 STRIPE_SECRET_KEY = os.environ.get("STRIPE_SECRET_KEY")
 if not STRIPE_SECRET_KEY:
-    raise RuntimeError("STRIPE_SECRET_KEY env var is required")
+    raise RuntimeError("STRIPE_SECRET_KEY environment variable is required")
 
 stripe.api_key = STRIPE_SECRET_KEY
 
-FRONTEND_URL = os.environ.get("FRONTEND_URL", "https://ai-report-saas.onrender.com")
-SUCCESS_URL = f"{FRONTEND_URL}/Billing"
-CANCEL_URL = f"{FRONTEND_URL}/Billing"
+SUCCESS_URL = os.getenv(
+    "SUCCESS_URL",
+    "https://ai-report-saas.onrender.com/Billing",
+)
+CANCEL_URL = os.getenv(
+    "CANCEL_URL",
+    "https://ai-report-saas.onrender.com/Billing",
+)
 
-PRICE_IDS: Dict[str, str] = {
-    "basic": os.environ.get("STRIPE_BASIC_PRICE_ID", ""),
-    "pro": os.environ.get("STRIPE_PRO_PRICE_ID", ""),
-    "enterprise": os.environ.get("STRIPE_ENTERPRISE_PRICE_ID", ""),
-}
-
-# Make sure we at least have *some* price IDs configured
-if not any(PRICE_IDS.values()):
-    logger.warning("No Stripe price IDs configured in environment variables")
-
-WEBHOOK_SECRET = os.environ.get("STRIPE_WEBHOOK_SECRET")
-
-# ---------- FastAPI app ----------
-
+# ----- FastAPI app -----
 app = FastAPI()
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # you can tighten this later
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
 
-class CheckoutSessionRequest(BaseModel):
+class CheckoutRequest(BaseModel):
+    email: str
     plan: str  # "basic" | "pro" | "enterprise"
-    email: EmailStr
 
 
+class SubscriptionStatusResponse(BaseModel):
+    status: str
+    current_period_end: Optional[int] = None
+    plan: Optional[str] = None
+
+
+def price_for_plan(plan: str) -> str:
+    """
+    Map logical plan names from the UI to Stripe price IDs.
+    Raises HTTPException(400) if the plan is invalid or not configured.
+    """
+    plan = (plan or "").strip().lower()
+    if not plan:
+        raise HTTPException(status_code=400, detail="Plan is required.")
+
+    try:
+        if plan == "basic":
+            return os.environ["STRIPE_BASIC_PRICE_ID"]
+        elif plan == "pro":
+            return os.environ["STRIPE_PRO_PRICE_ID"]
+        elif plan == "enterprise":
+            return os.environ["STRIPE_ENTERPRISE_PRICE_ID"]
+        else:
+            raise KeyError(plan)
+    except KeyError:
+        # Either unknown plan key, or missing env var
+        raise HTTPException(status_code=400, detail="Invalid plan requested.")
+
+
+# ----- Health check -----
 @app.get("/health")
-async def health() -> dict:
+async def health():
     return {"status": "ok"}
 
 
+# ----- Create checkout session -----
 @app.post("/create-checkout-session")
-async def create_checkout_session(data: CheckoutSessionRequest) -> dict:
-    plan_key = data.plan.lower()
-    price_id = PRICE_IDS.get(plan_key)
-
-    if not price_id:
-        raise HTTPException(status_code=422, detail="Invalid plan selected")
+async def create_checkout_session(data: CheckoutRequest):
+    """
+    Called from the Billing Streamlit page.
+    Expects JSON: { "email": "...", "plan": "basic|pro|enterprise" }
+    Returns: { "checkout_url": "https://checkout.stripe.com/..." }
+    """
+    price_id = price_for_plan(data.plan)
 
     try:
         session = stripe.checkout.Session.create(
             mode="subscription",
-            payment_method_types=["card"],
-            customer_email=data.email,
             line_items=[{"price": price_id, "quantity": 1}],
-            # This is what makes the coupon/promo box appear on Stripe Checkout
-            allow_promotion_codes=True,
-            success_url=f"{SUCCESS_URL}?session_id={{CHECKOUT_SESSION_ID}}",
+            customer_email=data.email,
+            success_url=SUCCESS_URL + "?session_id={CHECKOUT_SESSION_ID}",
             cancel_url=CANCEL_URL,
-            metadata={"plan": plan_key, "email": data.email},
+            # This makes the "Have a promo code?" field appear on the
+            # Stripe checkout page. You configure coupons directly in Stripe.
+            allow_promotion_codes=True,
         )
-    except stripe.error.StripeError as exc:
-        logger.exception("Stripe error while creating checkout session")
-        raise HTTPException(status_code=500, detail=str(exc))
+    except stripe.error.StripeError as e:
+        logging.exception("Stripe error during checkout")
+        msg = getattr(e, "user_message", None) or str(e)
+        raise HTTPException(status_code=400, detail=msg)
 
     return {"checkout_url": session.url}
 
 
-@app.get("/subscription-status")
-async def subscription_status(email: str) -> dict:
+# ----- Subscription status (optional, used by Billing page) -----
+@app.get("/subscription-status", response_model=SubscriptionStatusResponse)
+async def subscription_status(email: str):
     """
-    Given a billing email, return the current subscription status and plan.
+    Check if the given email has an active Stripe subscription.
     """
     try:
         customers = stripe.Customer.list(email=email, limit=1)
-    except stripe.error.StripeError as exc:
-        logger.exception("Stripe error while looking up customer")
-        raise HTTPException(status_code=500, detail=str(exc))
+        if not customers.data:
+            return SubscriptionStatusResponse(status="none")
 
-    if not customers.data:
-        return {"active": False, "plan": None, "status": "none"}
+        customer = customers.data[0]
+        subs = stripe.Subscription.list(
+            customer=customer.id,
+            limit=1,
+            status="all",
+        )
+        if not subs.data:
+            return SubscriptionStatusResponse(status="none")
 
-    customer = customers.data[0]
+        sub = subs.data[0]
+        items = sub["items"]["data"]
+        plan_nickname = None
+        if items:
+            plan_nickname = items[0]["price"].get("nickname")
+
+        return SubscriptionStatusResponse(
+            status=sub.status,
+            current_period_end=sub.current_period_end,
+            plan=plan_nickname,
+        )
+    except stripe.error.StripeError as e:
+        logging.exception("Stripe error while checking subscription status")
+        msg = getattr(e, "user_message", None) or str(e)
+        raise HTTPException(status_code=400, detail=msg)
+
+
+# ----- Stripe webhook (for future expansion) -----
+@app.post("/webhook")
+async def stripe_webhook(
+    request: Request,
+    stripe_signature: str = Header(None, alias="stripe-signature"),
+):
+    """
+    Generic Stripe webhook handler. Right now it just verifies the signature
+    and logs the event type so it always returns 200.
+    """
+    payload = await request.body()
+    endpoint_secret = os.environ.get("STRIPE_WEBHOOK_SECRET")
+
+    if not endpoint_secret:
+        # If you haven't configured a webhook secret yet,
+        # don't fail – just accept the event.
+        logging.warning("STRIPE_WEBHOOK_SECRET not configured; skipping verification.")
+        return {"received": True}
 
     try:
-        subs = stripe.Subscription.list(customer=customer.id, status="all", limit=1)
-    except stripe.error.StripeError as exc:
-        logger.exception("Stripe error while listing subscriptions")
-        raise HTTPException(status_code=500, detail=str(exc))
+        event = stripe.Webhook.construct_event(
+            payload=payload,
+            sig_header=stripe_signature,
+            secret=endpoint_secret,
+        )
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid payload")
+    except stripe.error.SignatureVerificationError:
+        raise HTTPException(status_code=400, detail="Invalid signature")
 
-    if not subs.data:
-        return {"active": False, "plan": None, "status": "none"}
+    logging.info("Received Stripe event type: %s", event["type"])
+    # You can add per-event handling here later (invoice.paid, etc.)
 
-    sub = subs.data[0]
-    status = sub.status
-    price_id = sub["items"]["data"][0]["price"]["id"]
-
-    plan_key = None
-    for key, pid in PRICE_IDS.items():
-        if pid and pid == price_id:
-            plan_key = key
-            break
-
-    return {
-        "active": status in ("trialing", "active", "past_due"),
-        "plan": plan_key,
-        "status": status,
-        "current_period_end": sub.current_period_end,
-    }
-
-
-@app.post("/webhook")
-async def stripe_webhook(request: Request):
-    payload = await request.body()
-    sig_header = request.headers.get("Stripe-Signature")
-
-    if WEBHOOK_SECRET:
-        try:
-            event = stripe.Webhook.construct_event(
-                payload=payload,
-                sig_header=sig_header,
-                secret=WEBHOOK_SECRET,
-            )
-        except ValueError:
-            # Invalid payload
-            raise HTTPException(status_code=400, detail="Invalid payload")
-        except stripe.error.SignatureVerificationError:
-            # Invalid signature
-            raise HTTPException(status_code=400, detail="Invalid signature")
-    else:
-        # If you haven't configured a webhook secret yet, just parse the JSON without verification.
-        logger.warning("STRIPE_WEBHOOK_SECRET not set; skipping signature verification")
-        # This is a minimal fallback; for production you should configure WEBHOOK_SECRET.
-        import json as _json
-        event = stripe.Event.construct_from(_json.loads(payload.decode("utf-8")), stripe.api_key)
-
-    logger.info("Received Stripe event: %s", event["type"])
-
-    # Add per-event handling here if you want.
     return {"received": True}
