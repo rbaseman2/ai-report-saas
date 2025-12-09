@@ -65,17 +65,14 @@ def price_for_plan(plan: str) -> str:
         else:
             raise KeyError(plan)
     except KeyError:
-        # Either unknown plan key, or missing env var
         raise HTTPException(status_code=400, detail="Invalid plan requested.")
 
 
-# ----- Health check -----
 @app.get("/health")
 async def health():
     return {"status": "ok"}
 
 
-# ----- Create checkout session -----
 @app.post("/create-checkout-session")
 async def create_checkout_session(data: CheckoutRequest):
     """
@@ -92,9 +89,7 @@ async def create_checkout_session(data: CheckoutRequest):
             customer_email=data.email,
             success_url=SUCCESS_URL + "?session_id={CHECKOUT_SESSION_ID}",
             cancel_url=CANCEL_URL,
-            # This makes the "Have a promo code?" field appear on the
-            # Stripe checkout page. You configure coupons directly in Stripe.
-            allow_promotion_codes=True,
+            allow_promotion_codes=True,   # <--- enables coupon field at checkout
         )
     except stripe.error.StripeError as e:
         logging.exception("Stripe error during checkout")
@@ -104,59 +99,43 @@ async def create_checkout_session(data: CheckoutRequest):
     return {"checkout_url": session.url}
 
 
-# ----- Subscription status (optional, used by Billing page) -----
 @app.get("/subscription-status", response_model=SubscriptionStatusResponse)
 async def subscription_status(email: str):
-    """
-    Check if the given email has an active Stripe subscription.
-    """
     try:
         customers = stripe.Customer.list(email=email, limit=1)
         if not customers.data:
             return SubscriptionStatusResponse(status="none")
 
         customer = customers.data[0]
-        subs = stripe.Subscription.list(
-            customer=customer.id,
-            limit=1,
-            status="all",
-        )
+        subs = stripe.Subscription.list(customer=customer.id, limit=1, status="all")
         if not subs.data:
             return SubscriptionStatusResponse(status="none")
 
         sub = subs.data[0]
         items = sub["items"]["data"]
-        plan_nickname = None
-        if items:
-            plan_nickname = items[0]["price"].get("nickname")
+        plan_nickname = items[0]["price"].get("nickname") if items else None
 
         return SubscriptionStatusResponse(
             status=sub.status,
             current_period_end=sub.current_period_end,
             plan=plan_nickname,
         )
+
     except stripe.error.StripeError as e:
         logging.exception("Stripe error while checking subscription status")
         msg = getattr(e, "user_message", None) or str(e)
         raise HTTPException(status_code=400, detail=msg)
 
 
-# ----- Stripe webhook (for future expansion) -----
 @app.post("/webhook")
 async def stripe_webhook(
     request: Request,
     stripe_signature: str = Header(None, alias="stripe-signature"),
 ):
-    """
-    Generic Stripe webhook handler. Right now it just verifies the signature
-    and logs the event type so it always returns 200.
-    """
     payload = await request.body()
     endpoint_secret = os.environ.get("STRIPE_WEBHOOK_SECRET")
 
     if not endpoint_secret:
-        # If you haven't configured a webhook secret yet,
-        # don't fail – just accept the event.
         logging.warning("STRIPE_WEBHOOK_SECRET not configured; skipping verification.")
         return {"received": True}
 
@@ -172,6 +151,5 @@ async def stripe_webhook(
         raise HTTPException(status_code=400, detail="Invalid signature")
 
     logging.info("Received Stripe event type: %s", event["type"])
-    # You can add per-event handling here later (invoice.paid, etc.)
 
     return {"received": True}
