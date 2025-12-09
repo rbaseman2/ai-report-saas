@@ -1,223 +1,165 @@
 # server/webhook.py
 
 import os
+import json
+from typing import Optional
+
 import stripe
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, EmailStr
-from typing import Literal
+from pydantic import BaseModel
 
-# ======================
-# Env & Stripe setup
-# ======================
+# ----- Stripe + env setup -----
 
-STRIPE_SECRET_KEY = os.environ.get("STRIPE_SECRET_KEY")
-STRIPE_WEBHOOK_SECRET = os.environ.get("STRIPE_WEBHOOK_SECRET", "")
+stripe.api_key = os.environ["STRIPE_SECRET_KEY"]
 
-# FRONTEND_URL is your Streamlit app base (used mainly for CORS)
-FRONTEND_URL = os.environ.get("FRONTEND_URL", "https://ai-report-saas.onrender.com")
+FRONTEND_URL = os.environ["FRONTEND_URL"]
+SUCCESS_URL = os.getenv("SUCCESS_URL", f"{FRONTEND_URL}/UploadData")
+WEBHOOK_SECRET = os.getenv("STRIPE_WEBHOOK_SECRET")
 
-# SUCCESS_URL is where Stripe should send users back after checkout
-SUCCESS_URL = os.environ.get(
-    "SUCCESS_URL",
-    "https://ai-report-saas.onrender.com/Billing",
-)
+STRIPE_PRICE_BASIC = os.environ["STRIPE_PRICE_BASIC"]
+STRIPE_PRICE_PRO = os.environ["STRIPE_PRICE_PRO"]
+STRIPE_PRICE_ENTERPRISE = os.environ["STRIPE_PRICE_ENTERPRISE"]
 
-# These env vars already exist in your backend (per your screenshot)
-STRIPE_PRICE_BASIC = os.environ.get("STRIPE_PRICE_BASIC")
-STRIPE_PRICE_PRO = os.environ.get("STRIPE_PRICE_PRO")
-STRIPE_PRICE_ENTERPRISE = os.environ.get("STRIPE_PRICE_ENTERPRISE")
-
-if not STRIPE_SECRET_KEY:
-    raise RuntimeError("STRIPE_SECRET_KEY is not set")
-
-stripe.api_key = STRIPE_SECRET_KEY
-
-# Map plan name -> Stripe price ID
 PLAN_TO_PRICE = {
     "basic": STRIPE_PRICE_BASIC,
     "pro": STRIPE_PRICE_PRO,
     "enterprise": STRIPE_PRICE_ENTERPRISE,
 }
 
-# Reverse: price ID -> plan name
-PRICE_TO_PLAN = {v: k for k, v in PLAN_TO_PRICE.items() if v}
-
-# Limits returned to the Streamlit Billing page
-PLAN_LIMITS = {
-    "basic": {"max_documents": 20, "max_chars": 400_000},
-    "pro": {"max_documents": 75, "max_chars": 1_500_000},
-    "enterprise": {"max_documents": 250, "max_chars": 5_000_000},
-}
-
-# ======================
-# FastAPI setup
-# ======================
+# ----- FastAPI app -----
 
 app = FastAPI()
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[FRONTEND_URL, "https://ai-report-saas.onrender.com"],
+    allow_origins=[FRONTEND_URL, "http://localhost:8501"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# ======================
-# Models
-# ======================
+# ----- Models -----
 
-class CheckoutRequest(BaseModel):
-    email: EmailStr
-    plan: Literal["basic", "pro", "enterprise"]
+class CheckoutSessionRequest(BaseModel):
+    plan: str
+    email: str
+    coupon: Optional[str] = None
 
 
-class CheckoutResponse(BaseModel):
+class CheckoutSessionResponse(BaseModel):
+    # Return BOTH so old + new frontends work
+    url: str
     checkout_url: str
 
 
 class SubscriptionStatusResponse(BaseModel):
-    plan: str
-    max_documents: int
-    max_chars: int
+    is_active: bool
+    plan: Optional[str] = None
+    current_period_end: Optional[int] = None
 
 
-# ======================
-# Health
-# ======================
+class WebhookAck(BaseModel):
+    received: bool
+
+
+# ----- Health -----
 
 @app.get("/health")
 async def health():
     return {"status": "ok"}
 
 
-# ======================
-# Create Checkout Session
-# ======================
+# ----- Create checkout session -----
 
-@app.post("/create-checkout-session", response_model=CheckoutResponse)
-async def create_checkout_session(data: CheckoutRequest):
+@app.post("/create-checkout-session", response_model=CheckoutSessionResponse)
+async def create_checkout_session(data: CheckoutSessionRequest):
     price_id = PLAN_TO_PRICE.get(data.plan)
-
     if not price_id:
-        # This is what shows up as "Invalid plan requested" in Streamlit
-        raise HTTPException(status_code=400, detail="Invalid plan requested")
+        raise HTTPException(status_code=400, detail="Invalid plan selected")
 
-    try:
-        session = stripe.checkout.Session.create(
-            mode="subscription",
-            customer_email=data.email,
-            line_items=[
-                {
-                    "price": price_id,
-                    "quantity": 1,
-                }
-            ],
-            # Let users enter a promo code directly on the Stripe checkout page
-            allow_promotion_codes=True,
-            success_url=f"{SUCCESS_URL}?session_id={{CHECKOUT_SESSION_ID}}",
-            cancel_url=SUCCESS_URL,
-        )
-    except stripe.error.StripeError as e:
-        # Surface a friendly error to the front-end
-        msg = e.user_message or str(e)
-        raise HTTPException(status_code=400, detail=f"Stripe error: {msg}")
+    session_args = {
+        "mode": "subscription",
+        "line_items": [{"price": price_id, "quantity": 1}],
+        "customer_email": data.email,
+        "success_url": f"{SUCCESS_URL}?session_id={{CHECKOUT_SESSION_ID}}",
+        "cancel_url": f"{FRONTEND_URL}/Billing?canceled=1",
+        "metadata": {
+            "plan": data.plan,
+            "email": data.email,
+        },
+    }
 
-    return CheckoutResponse(checkout_url=session.url)
+    if data.coupon:
+        # coupon code from your “welcome” coupon, etc.
+        session_args["discounts"] = [{"coupon": data.coupon}]
+
+    session = stripe.checkout.Session.create(**session_args)
+
+    # Return both keys to satisfy whatever the Billing page expects
+    return CheckoutSessionResponse(
+        url=session.url,
+        checkout_url=session.url,
+    )
 
 
-# ======================
-# Webhook (from Stripe)
-# ======================
+# ----- Subscription status (called from Billing page) -----
 
-@app.post("/webhook")
+@app.get("/subscription-status", response_model=SubscriptionStatusResponse)
+async def subscription_status(email: str):
+    # Find customer by email
+    customers = stripe.Customer.list(email=email, limit=1)
+    if not customers.data:
+        return SubscriptionStatusResponse(is_active=False)
+
+    customer = customers.data[0]
+
+    subs = stripe.Subscription.list(
+        customer=customer.id,
+        status="active",
+        limit=1,
+    )
+
+    if not subs.data:
+        return SubscriptionStatusResponse(is_active=False)
+
+    sub = subs.data[0]
+    item = sub["items"]["data"][0]
+    price = item["price"]
+
+    # Prefer nickname; fall back to price id
+    plan_name = price.get("nickname") or price.get("id")
+
+    return SubscriptionStatusResponse(
+        is_active=True,
+        plan=plan_name,
+        current_period_end=sub.get("current_period_end"),
+    )
+
+
+# ----- Stripe webhook -----
+
+@app.post("/webhook", response_model=WebhookAck)
 async def stripe_webhook(request: Request):
     payload = await request.body()
     sig_header = request.headers.get("stripe-signature")
 
     try:
-        if STRIPE_WEBHOOK_SECRET:
+        if WEBHOOK_SECRET:
             event = stripe.Webhook.construct_event(
-                payload, sig_header, STRIPE_WEBHOOK_SECRET
+                payload=payload,
+                sig_header=sig_header,
+                secret=WEBHOOK_SECRET,
             )
         else:
-            # Unsafe, but useful if you haven't configured the webhook secret yet
+            # Unsafe, but useful if webhook secret not configured in dev
             event = stripe.Event.construct_from(
-                request.json(), stripe.api_key  # type: ignore[arg-type]
+                json.loads(payload.decode("utf-8")), stripe.api_key
             )
     except Exception as e:
-        raise HTTPException(status_code=400, detail=f"Webhook error: {e}")
+        raise HTTPException(status_code=400, detail=str(e))
 
-    event_type = event["type"]
+    # You can add handling here if you want:
+    # if event["type"] == "customer.subscription.updated": ...
 
-    # You can expand this later if you want to store subscription info
-    if event_type == "checkout.session.completed":
-        # session = event["data"]["object"]
-        # e.g. you could log or persist data here
-        pass
-
-    return {"status": "success"}
-
-
-# ======================
-# Subscription Status
-# ======================
-
-@app.get("/subscription-status", response_model=SubscriptionStatusResponse)
-async def subscription_status(email: EmailStr):
-    """
-    Called by the Streamlit Billing page.
-
-    If a subscription is found, we map its price_id back to
-    basic/pro/enterprise and return the plan + limits.
-
-    If NOT found, Streamlit treats 404 as "free plan".
-    """
-
-    try:
-        customers = stripe.Customer.list(email=email, limit=1)
-    except stripe.error.StripeError as e:
-        msg = e.user_message or str(e)
-        raise HTTPException(status_code=500, detail=f"Stripe error: {msg}")
-
-    if not customers.data:
-        # Streamlit interprets 404 as "no active subscription"
-        raise HTTPException(status_code=404, detail="No customer for this email")
-
-    customer = customers.data[0]
-
-    try:
-        subs = stripe.Subscription.list(
-            customer=customer.id,
-            status="all",  # any status; we just grab the most recent
-            limit=1,
-        )
-    except stripe.error.StripeError as e:
-        msg = e.user_message or str(e)
-        raise HTTPException(status_code=500, detail=f"Stripe error: {msg}")
-
-    if not subs.data:
-        raise HTTPException(status_code=404, detail="No subscription for this customer")
-
-    sub = subs.data[0]
-
-    # Safely get the first price ID
-    try:
-        items = sub["items"]["data"]
-        price_id = items[0]["price"]["id"]
-    except (KeyError, IndexError):
-        raise HTTPException(status_code=404, detail="Subscription has no price")
-
-    plan = PRICE_TO_PLAN.get(price_id)
-    if not plan or plan not in PLAN_LIMITS:
-        # Unknown price → treat as "no recognized plan"
-        raise HTTPException(status_code=404, detail="Unknown price for subscription")
-
-    limits = PLAN_LIMITS[plan]
-
-    return SubscriptionStatusResponse(
-        plan=plan,
-        max_documents=limits["max_documents"],
-        max_chars=limits["max_chars"],
-    )
+    return WebhookAck(received=True)
