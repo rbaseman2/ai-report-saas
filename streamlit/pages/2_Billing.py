@@ -5,11 +5,11 @@ import streamlit as st
 # --------------------------------------------------------------------
 # Config
 # --------------------------------------------------------------------
-# Prefer env var so we don't need secrets.toml in Render
 BACKEND_URL = os.getenv("BACKEND_URL") or st.secrets.get("BACKEND_URL", "")
 BACKEND_URL = BACKEND_URL.rstrip("/")
 
 if not BACKEND_URL:
+    st.set_page_config(page_title="Billing & Subscription", page_icon="💳")
     st.error("BACKEND_URL is not configured. Please set it in Render env vars.")
     st.stop()
 
@@ -58,9 +58,7 @@ def start_checkout(plan_key: str, email: str):
         return
 
     if not resp.ok:
-        st.error(
-            f"Checkout error: {resp.status_code} {resp.text}"
-        )
+        st.error(f"Checkout error: {resp.status_code} {resp.text}")
         return
 
     try:
@@ -75,12 +73,10 @@ def start_checkout(plan_key: str, email: str):
         st.write("Raw response:", data)
         return
 
-    # Let user know what's happening and redirect
     st.success("Redirecting you to Stripe Checkout…")
+    # Redirect in-place
     st.markdown(
-        f"""
-        <meta http-equiv="refresh" content="0; url={checkout_url}">
-        """,
+        f'<meta http-equiv="refresh" content="0; url={checkout_url}">',
         unsafe_allow_html=True,
     )
 
@@ -90,9 +86,12 @@ def start_checkout(plan_key: str, email: str):
 # --------------------------------------------------------------------
 st.title("Billing & Subscription")
 
-# Show success/cancel messages from Stripe redirect
-query_params = st.experimental_get_query_params()
-status = query_params.get("status", [None])[0]
+# --- NEW: use st.query_params instead of experimental_get_query_params ---
+params = st.query_params
+status = params.get("status", None)
+
+if isinstance(status, list):
+    status = status[0]
 
 if status == "success":
     st.success("Payment successful! Your subscription is now active.")
@@ -116,7 +115,6 @@ current_status = None
 if check_clicked and billing_email:
     current_status = fetch_subscription_status(billing_email)
 
-# Banner for subscription result
 with col_status:
     if current_status is not None:
         if current_status.get("has_active_subscription"):
@@ -128,7 +126,6 @@ with col_status:
         else:
             st.info("No active subscription found for this email.")
 
-# Simple status line
 st.write(
     "Status:",
     "active"
@@ -143,9 +140,6 @@ st.write(
     "You can upgrade later as your needs grow."
 )
 
-# --------------------------------------------------------------------
-# Plans
-# --------------------------------------------------------------------
 col_basic, col_pro, col_ent = st.columns(3)
 
 with col_basic:
