@@ -4,27 +4,27 @@ import io
 import os
 import requests
 import streamlit as st
-from PyPDF2 import PdfReader  # make sure this is in requirements.txt
+from PyPDF2 import PdfReader  # ensure this is in requirements.txt
 
 st.set_page_config(page_title="Upload Data – AI Report", page_icon="📄")
 
-# Get backend URL from environment variable instead of st.secrets
+# Get backend URL from environment variable
 BACKEND_URL = os.getenv("BACKEND_URL")
 
+# --- Sidebar navigation (only existing pages) ---
 st.sidebar.title("Navigation")
 st.sidebar.page_link("Home.py", label="Home")
 st.sidebar.page_link("pages/1_Upload_Data.py", label="Upload Data", disabled=True)
 st.sidebar.page_link("pages/2_Billing.py", label="Billing")
-st.sidebar.page_link("pages/3_Terms.py", label="Terms", disabled=True)
-st.sidebar.page_link("pages/4_Privacy.py", label="Privacy", disabled=True)
 
 st.title("Upload Data")
 
 if not BACKEND_URL:
     st.error(
         "BACKEND_URL environment variable is not set for the frontend service.\n\n"
-        "Go to the **Render dashboard → your Streamlit service → Environment** and add "
-        "`BACKEND_URL` pointing to your backend (e.g. `https://ai-report-backend-xxxx.onrender.com`)."
+        "Go to the **Render dashboard → your Streamlit (frontend) service → Environment** "
+        "and add `BACKEND_URL` pointing to your backend "
+        "(e.g. `https://ai-report-backend-xxxx.onrender.com`)."
     )
     st.stop()
 
@@ -84,7 +84,7 @@ def extract_text_from_upload(file) -> str:
             pages.append(page.extract_text() or "")
         return "\n\n".join(pages)
 
-    # For simplicity, treat other types as text directly
+    # For simplicity, treat other types as raw text
     return file.read().decode(errors="ignore")
 
 
