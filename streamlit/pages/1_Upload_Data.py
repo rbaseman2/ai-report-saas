@@ -1,136 +1,133 @@
-# streamlit/pages/1_Upload_Data.py
-
-import io
 import os
 import requests
 import streamlit as st
-from PyPDF2 import PdfReader  # ensure this is in requirements.txt
 
-st.set_page_config(page_title="Upload Data – AI Report", page_icon="📄")
-
-# Get backend URL from environment variable
-BACKEND_URL = os.getenv("BACKEND_URL")
-
-# --- Sidebar navigation (only existing pages) ---
-st.sidebar.title("Navigation")
-st.sidebar.page_link("Home.py", label="Home")
-st.sidebar.page_link("pages/1_Upload_Data.py", label="Upload Data", disabled=True)
-st.sidebar.page_link("pages/2_Billing.py", label="Billing")
+st.set_page_config(page_title="Upload Data – AI Report", layout="wide")
 
 st.title("Upload Data")
 
+BACKEND_URL = os.getenv("BACKEND_URL")
 if not BACKEND_URL:
-    st.error(
-        "BACKEND_URL environment variable is not set for the frontend service.\n\n"
-        "Go to the **Render dashboard → your Streamlit (frontend) service → Environment** "
-        "and add `BACKEND_URL` pointing to your backend "
-        "(e.g. `https://ai-report-backend-xxxx.onrender.com`)."
-    )
+    st.error("BACKEND_URL is not configured.")
     st.stop()
 
-billing_email = st.text_input(
-    "Billing email (used to look up your subscription)",
-    value=st.session_state.get("billing_email", ""),
-)
+if "billing_email" not in st.session_state:
+    st.session_state.billing_email = ""
 
-if st.button("Check subscription plan"):
-    if not billing_email:
-        st.warning("Please enter your billing email first.")
-    else:
-        st.session_state["billing_email"] = billing_email
+if "current_plan" not in st.session_state:
+    st.session_state.current_plan = None
+
+if "subscription_status" not in st.session_state:
+    st.session_state.subscription_status = "none"
+
+st.markdown("Billing email (used to look up your subscription)")
+email = st.text_input("", value=st.session_state.billing_email, placeholder="you@example.com")
+
+def check_plan():
+    if not email:
+        st.warning("Please enter a billing email first.")
+        return
+
+    try:
+        r = requests.get(
+            f"{BACKEND_URL}/subscription-status",
+            params={"email": email},
+            timeout=20
+        )
+    except Exception as e:
+        st.error(f"Error contacting backend: {e}")
+        return
+
+    if r.status_code != 200:
+        st.error(f"Backend error: {r.status_code}")
         try:
-            resp = requests.get(
-                f"{BACKEND_URL.rstrip('/')}/subscription-status",
-                params={"email": billing_email},
-                timeout=20,
-            )
-            if resp.status_code != 200:
-                st.error(f"Backend error: {resp.status_code} - {resp.text}")
-            else:
-                data = resp.json()
-                plan = data.get("plan") or "basic"
-                st.session_state["current_plan"] = plan
-                status = data.get("status", "none")
-                st.success(
-                    f"Subscription status: {status}. Plan: {plan.capitalize() if plan else 'None'}"
-                )
-        except Exception as e:
-            st.error(f"Error contacting backend: {e}")
+            st.code(r.json())
+        except Exception:
+            st.write(r.text)
+        return
 
-current_plan = st.session_state.get("current_plan", "basic")
-st.markdown(f"**Current plan (for summaries):** `{current_plan.capitalize()}`")
+    data = r.json() or {}
+    st.session_state.billing_email = email
+    st.session_state.current_plan = data.get("plan")  # may be None
+    st.session_state.subscription_status = data.get("status") or "none"
 
-st.markdown("---")
-st.subheader("Upload a report file")
+st.button("Check subscription plan", on_click=check_plan)
 
-uploaded_file = st.file_uploader(
-    "Upload a TXT, MD, PDF, DOCX, or CSV file", type=["txt", "md", "pdf", "docx", "csv"]
+# ---- SAFE DISPLAY (no NoneType.capitalize)
+current_plan = st.session_state.current_plan
+plan_value = current_plan or "none"
+plan_label = plan_value.capitalize() if isinstance(plan_value, str) else "none"
+status_label = st.session_state.subscription_status or "none"
+
+st.markdown(f"**Current plan (for summaries):** `{plan_label}`")
+st.markdown(f"**Status:** `{status_label}`")
+
+st.divider()
+
+st.write("Upload a report file (TXT, MD, PDF, DOCX, CSV).")
+uploaded = st.file_uploader(
+    "Drag and drop files here",
+    type=["txt", "md", "pdf", "docx", "csv"],
+    accept_multiple_files=False
 )
 
-manual_text = st.text_area("Or paste text manually", height=200)
+st.write("Or paste text manually")
+manual_text = st.text_area("", height=180)
 
-# ------------------------------------------------------------------
-# Extract text from uploaded file
-# ------------------------------------------------------------------
-def extract_text_from_upload(file) -> str:
-    if file is None:
-        return ""
-    name = file.name.lower()
+st.divider()
 
-    if name.endswith(".pdf"):
-        reader = PdfReader(io.BytesIO(file.read()))
-        pages = []
-        for page in reader.pages:
-            pages.append(page.extract_text() or "")
-        return "\n\n".join(pages)
+st.header("2. Generate a summary")
 
-    # For simplicity, treat other types as raw text
-    return file.read().decode(errors="ignore")
+email_summary = st.checkbox("Email this summary to someone", value=False)
+recipient_email = ""
+if email_summary:
+    recipient_email = st.text_input("Recipient email", value="")
 
+def generate_summary():
+    if not st.session_state.billing_email:
+        st.warning("Enter billing email and click 'Check subscription plan' first.")
+        return
 
-report_text = ""
+    if not uploaded and not manual_text.strip():
+        st.warning("Upload a file or paste text first.")
+        return
 
-if uploaded_file is not None:
-    report_text = extract_text_from_upload(uploaded_file)
-elif manual_text.strip():
-    report_text = manual_text.strip()
+    payload = {
+        "billing_email": st.session_state.billing_email,
+        "send_email": bool(email_summary),
+        "recipient_email": recipient_email.strip() if email_summary else "",
+        "text": manual_text.strip(),
+    }
 
-st.markdown("---")
-st.subheader("2. Generate a summary")
+    files = None
+    if uploaded:
+        files = {"file": (uploaded.name, uploaded.getvalue())}
 
-email_checkbox = st.checkbox("Email this summary to someone")
-recipient_email = None
-if email_checkbox:
-    recipient_email = st.text_input("Recipient email", key="recipient_email")
+    try:
+        r = requests.post(f"{BACKEND_URL}/generate-summary", data=payload, files=files, timeout=120)
+    except Exception as e:
+        st.error(f"Error contacting backend: {e}")
+        return
 
-if st.button("Generate Business Summary"):
-    if not report_text.strip():
-        st.warning("Please upload a file or paste text to summarize.")
-    else:
-        with st.spinner("Generating summary..."):
-            try:
-                payload = {
-                    "text": report_text,
-                    "plan": current_plan or "basic",
-                    "recipient_email": recipient_email or None,
-                }
-                resp = requests.post(
-                    f"{BACKEND_URL.rstrip('/')}/summarize", json=payload, timeout=240
-                )
-                if resp.status_code != 200:
-                    st.error(f"Backend error: {resp.status_code} - {resp.text}")
-                else:
-                    data = resp.json()
-                    st.subheader("Summary:")
-                    st.write(data["summary"])
+    if r.status_code != 200:
+        st.error(f"Backend error: {r.status_code}")
+        try:
+            st.code(r.json())
+        except Exception:
+            st.write(r.text)
+        return
 
-                    if recipient_email:
-                        if data.get("emailed"):
-                            st.success(f"Summary emailed to {recipient_email}")
-                        else:
-                            st.warning(
-                                "Summary generated, but email could not be sent. "
-                                "Check email configuration."
-                            )
-            except Exception as e:
-                st.error(f"Error contacting backend: {e}")
+    data = r.json() or {}
+    summary = data.get("summary") or ""
+    email_sent = bool(data.get("email_sent"))
+
+    st.subheader("Summary:")
+    st.write(summary if summary else "(No summary returned)")
+
+    if email_summary:
+        if email_sent:
+            st.success(f"Email sent to {recipient_email.strip()}")
+        else:
+            st.warning("Email was requested but was not sent. Check backend logs / Brevo config.")
+
+st.button("Generate Business Summary", on_click=generate_summary)
