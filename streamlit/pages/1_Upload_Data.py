@@ -1,13 +1,15 @@
 # streamlit/pages/1_Upload_Data.py
 
 import io
+import os
 import requests
 import streamlit as st
 from PyPDF2 import PdfReader  # make sure this is in requirements.txt
 
 st.set_page_config(page_title="Upload Data – AI Report", page_icon="📄")
 
-BACKEND_URL = st.secrets.get("BACKEND_URL")
+# Get backend URL from environment variable instead of st.secrets
+BACKEND_URL = os.getenv("BACKEND_URL")
 
 st.sidebar.title("Navigation")
 st.sidebar.page_link("Home.py", label="Home")
@@ -17,6 +19,14 @@ st.sidebar.page_link("pages/3_Terms.py", label="Terms", disabled=True)
 st.sidebar.page_link("pages/4_Privacy.py", label="Privacy", disabled=True)
 
 st.title("Upload Data")
+
+if not BACKEND_URL:
+    st.error(
+        "BACKEND_URL environment variable is not set for the frontend service.\n\n"
+        "Go to the **Render dashboard → your Streamlit service → Environment** and add "
+        "`BACKEND_URL` pointing to your backend (e.g. `https://ai-report-backend-xxxx.onrender.com`)."
+    )
+    st.stop()
 
 billing_email = st.text_input(
     "Billing email (used to look up your subscription)",
@@ -30,7 +40,7 @@ if st.button("Check subscription plan"):
         st.session_state["billing_email"] = billing_email
         try:
             resp = requests.get(
-                f"{BACKEND_URL}/subscription-status",
+                f"{BACKEND_URL.rstrip('/')}/subscription-status",
                 params={"email": billing_email},
                 timeout=20,
             )
@@ -48,7 +58,6 @@ if st.button("Check subscription plan"):
             st.error(f"Error contacting backend: {e}")
 
 current_plan = st.session_state.get("current_plan", "basic")
-
 st.markdown(f"**Current plan (for summaries):** `{current_plan.capitalize()}`")
 
 st.markdown("---")
@@ -106,7 +115,7 @@ if st.button("Generate Business Summary"):
                     "recipient_email": recipient_email or None,
                 }
                 resp = requests.post(
-                    f"{BACKEND_URL}/summarize", json=payload, timeout=240
+                    f"{BACKEND_URL.rstrip('/')}/summarize", json=payload, timeout=240
                 )
                 if resp.status_code != 200:
                     st.error(f"Backend error: {resp.status_code} - {resp.text}")

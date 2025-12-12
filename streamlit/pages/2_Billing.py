@@ -1,11 +1,13 @@
 # streamlit/pages/2_Billing.py
 
+import os
 import requests
 import streamlit as st
 
 st.set_page_config(page_title="Billing & Subscription", page_icon="💳")
 
-BACKEND_URL = st.secrets.get("BACKEND_URL")
+# Get backend URL from environment variable instead of st.secrets
+BACKEND_URL = os.getenv("BACKEND_URL")
 
 st.sidebar.title("Navigation")
 st.sidebar.page_link("Home.py", label="Home")
@@ -15,6 +17,14 @@ st.sidebar.page_link("pages/3_Terms.py", label="Terms", disabled=True)
 st.sidebar.page_link("pages/4_Privacy.py", label="Privacy", disabled=True)
 
 st.title("Billing & Subscription")
+
+if not BACKEND_URL:
+    st.error(
+        "BACKEND_URL environment variable is not set for the frontend service.\n\n"
+        "Go to the **Render dashboard → your Streamlit service → Environment** and add "
+        "`BACKEND_URL` pointing to your backend (e.g. `https://ai-report-backend-xxxx.onrender.com`)."
+    )
+    st.stop()
 
 # Show success banner if returned from checkout
 query_params = st.query_params
@@ -38,7 +48,7 @@ if st.button("Save email & check current plan"):
         st.session_state["billing_email"] = billing_email
         try:
             resp = requests.get(
-                f"{BACKEND_URL}/subscription-status",
+                f"{BACKEND_URL.rstrip('/')}/subscription-status",
                 params={"email": billing_email},
                 timeout=20,
             )
@@ -135,7 +145,9 @@ def start_checkout(plan: str):
 
     try:
         resp = requests.post(
-            f"{BACKEND_URL}/create-checkout-session", json=payload, timeout=40
+            f"{BACKEND_URL.rstrip('/')}/create-checkout-session",
+            json=payload,
+            timeout=40,
         )
         if resp.status_code != 200:
             error_placeholder.error(
@@ -145,7 +157,8 @@ def start_checkout(plan: str):
             data = resp.json()
             checkout_url = data["checkout_url"]
             st.markdown(
-                f"[Click here to complete checkout]({checkout_url})", unsafe_allow_html=True
+                f"[Click here to complete checkout]({checkout_url})",
+                unsafe_allow_html=True,
             )
             st.info("If you are not redirected automatically, click the link above.")
     except Exception as e:
