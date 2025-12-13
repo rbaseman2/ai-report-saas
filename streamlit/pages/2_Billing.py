@@ -11,25 +11,47 @@ if not BACKEND_URL:
 
 st.title("Billing & Subscription")
 
-# Sidebar navigation (safe)
+# ----------------------------
+# Sidebar navigation (MUST match actual filenames)
+# ----------------------------
 with st.sidebar:
     st.header("Navigation")
+
+    # If you have a Home.py entrypoint, this will work.
+    # If not, it won't crash because we guard it.
     try:
         st.page_link("Home.py", label="Home")
     except Exception:
-        pass
+        st.write("Home")
+
     try:
-        st.page_link("pages/Upload_Data.py", label="Upload Data")
+        st.page_link("pages/1_Upload_Data.py", label="Upload Data")
+    except Exception:
+        st.write("Upload Data")
+
+    # ✅ This is the current page file name
+    st.page_link("pages/2_Billing.py", label="Billing", disabled=True)
+
+    # Only show Terms/Privacy if those files exist
+    try:
+        st.page_link("pages/3_Terms.py", label="Terms")
     except Exception:
         pass
-    st.page_link("pages/Billing.py", label="Billing", disabled=True)
+    try:
+        st.page_link("pages/4_Privacy.py", label="Privacy")
+    except Exception:
+        pass
 
-# Read status params (after Stripe checkout redirect)
+
+# ----------------------------
+# Stripe redirect status params (after checkout)
+# ----------------------------
 q = st.query_params
 if q.get("status") == "success":
     st.success("Payment successful! Your subscription is now active.")
 elif q.get("status") == "cancel":
     st.warning("Checkout canceled.")
+
 
 st.subheader("Step 1 — Enter your email")
 email = st.text_input(
@@ -44,27 +66,31 @@ with colA:
 
 plan = None
 status = "none"
+
+def fetch_status(e: str):
+    r = requests.get(f"{BACKEND_URL}/subscription-status", params={"email": e}, timeout=20)
+    if r.status_code != 200:
+        raise RuntimeError(f"{r.status_code}: {r.text}")
+    return r.json()
+
 if check:
     st.session_state["billing_email"] = email.strip()
-    try:
-        r = requests.get(f"{BACKEND_URL}/subscription-status", params={"email": email.strip()}, timeout=20)
-        if r.status_code == 200:
-            data = r.json()
+    if not email.strip():
+        st.error("Enter an email.")
+    else:
+        try:
+            data = fetch_status(email.strip())
             plan = data.get("plan")
             status = data.get("status") or "none"
-        else:
-            st.error(f"Backend error {r.status_code}: {r.text}")
-    except Exception as e:
-        st.error(f"Error contacting backend: {e}")
+        except Exception as e:
+            st.error(f"Error contacting backend: {e}")
 
-# Display current
-if "billing_email" in st.session_state and st.session_state["billing_email"].strip():
+# Auto refresh display if email saved
+if st.session_state.get("billing_email", "").strip():
     try:
-        r = requests.get(f"{BACKEND_URL}/subscription-status", params={"email": st.session_state["billing_email"]}, timeout=20)
-        if r.status_code == 200:
-            data = r.json()
-            plan = data.get("plan")
-            status = data.get("status") or "none"
+        data = fetch_status(st.session_state["billing_email"])
+        plan = data.get("plan")
+        status = data.get("status") or "none"
     except Exception:
         pass
 
@@ -81,6 +107,7 @@ plans = [
 ]
 
 cols = st.columns(3)
+
 for i, (pname, price, bullets) in enumerate(plans):
     with cols[i]:
         st.markdown(f"### {pname.title()}\n**{price}**")
@@ -101,9 +128,8 @@ for i, (pname, price, bullets) in enumerate(plans):
                         if not url:
                             st.error("Checkout URL was not returned by backend.")
                         else:
-                            # ✅ Redirect to Stripe checkout
-                            st.markdown(f"[Click here to continue to checkout]({url})")
-                            st.info("If you are not redirected automatically, click the link above.")
+                            # ✅ Stripe checkout will include coupon box because backend uses allow_promotion_codes=True
                             st.components.v1.html(f"<script>window.location.href='{url}';</script>", height=0)
+                            st.markdown(f"[Click here if not redirected]({url})")
                 except Exception as e:
                     st.error(f"Failed to create checkout session: {e}")
