@@ -131,24 +131,58 @@ def _extract_text_from_upload(upload: UploadFile) -> str:
 
     # PDF
     if filename.endswith(".pdf"):
-        if PdfReader is None:
-            raise HTTPException(status_code=500, detail="PDF support not installed (missing pypdf).")
+        # Try multiple extractors so production doesn't depend on a single optional package.
+        # 1) pypdf (preferred for simple text PDFs)
+        if PdfReader is not None:
+            try:
+                import io
+                reader = PdfReader(io.BytesIO(content))
+                chunks = []
+                for p in reader.pages:
+                    try:
+                        chunks.append(p.extract_text() or "")
+                    except Exception:
+                        chunks.append("")
+                text = "\n".join(chunks).strip()
+                if text:
+                    return text
+            except Exception:
+                # fall through to other extractors
+                pass
+
+        # 2) pdfminer.six (good fallback, pure python)
         try:
             import io
-            reader = PdfReader(io.BytesIO(content))
+            from pdfminer.high_level import extract_text as _pdfminer_extract_text  # type: ignore
+            text = _pdfminer_extract_text(io.BytesIO(content)) or ""
+            text = text.strip()
+            if text:
+                return text
+        except Exception:
+            pass
+
+        # 3) PyMuPDF / fitz (often works well on tricky PDFs)
+        try:
+            import fitz  # type: ignore
+            doc = fitz.open(stream=content, filetype="pdf")
             chunks = []
-            for p in reader.pages:
+            for page in doc:
                 try:
-                    chunks.append(p.extract_text() or "")
+                    chunks.append(page.get_text() or "")
                 except Exception:
                     chunks.append("")
-            return "\n".join(chunks).strip()
-        except HTTPException:
-            raise
-        except Exception as e:
-            raise HTTPException(status_code=400, detail=f"Could not read PDF: {e}")
+            text = "\n".join(chunks).strip()
+            if text:
+                return text
+        except Exception:
+            pass
 
-    # DOCX
+        raise HTTPException(
+            status_code=500,
+            detail="PDF text extraction not available. Add 'pypdf' (recommended) or 'pdfminer.six' or 'pymupdf' to requirements.txt."
+        )
+
+# DOCX
     if filename.endswith(".docx"):
         if docx is None:
             raise HTTPException(status_code=500, detail="DOCX support not installed (missing python-docx).")
@@ -270,32 +304,46 @@ def _openai_summarize(text: str, plan: str) -> str:
         raise HTTPException(status_code=500, detail="OpenAI response parsing failed.")
 
 
-def _brevo_send_email(to_email: str, subject: str, html: str) -> None:
-    if not BREVO_API_KEY:
-        raise HTTPException(status_code=500, detail="Email is not configured (missing BREVO_API_KEY).")
-    if not EMAIL_FROM:
-        raise HTTPException(status_code=500, detail="Email sender is not configured (missing EMAIL_FROM).")
+def _brevo_send_email(*, to_email: str, subject: str, html: str) -> tuple[bool, str | None]:
+    """Send an email via Brevo Transactional API.
+
+    Returns: (sent_ok, error_message)
+    """
+    api_key = os.getenv("BREVO_API_KEY") or os.getenv("SENDINBLUE_API_KEY")  # allow old env name
+    sender_email = os.getenv("EMAIL_FROM") or os.getenv("BREVO_SENDER_EMAIL")
+    sender_name = os.getenv("EMAIL_FROM_NAME") or os.getenv("BREVO_SENDER_NAME") or "AI Report"
+    if not api_key:
+        return False, "BREVO_API_KEY is not set"
+    if not sender_email:
+        return False, "EMAIL_FROM is not set"
 
     url = "https://api.brevo.com/v3/smtp/email"
     headers = {
-        "api-key": BREVO_API_KEY,
-        "Content-Type": "application/json",
         "accept": "application/json",
+        "api-key": api_key,
+        "content-type": "application/json",
     }
     payload = {
-        "sender": {"email": EMAIL_FROM},
+        "sender": {"name": sender_name, "email": sender_email},
         "to": [{"email": to_email}],
         "subject": subject,
         "htmlContent": html,
     }
-    resp = requests.post(url, headers=headers, data=json.dumps(payload), timeout=30)
-    if resp.status_code >= 300:
-        raise HTTPException(status_code=500, detail=f"Brevo email failed: {resp.status_code} {resp.text[:500]}")
 
+    try:
+        resp = requests.post(url, headers=headers, json=payload, timeout=20)
+    except Exception as e:
+        logger.exception("Brevo send failed (request error)")
+        return False, f"Brevo request error: {e}"
 
-# -----------------------------
-# Routes
-# -----------------------------
+    # Brevo commonly returns 201 on success.
+    if resp.status_code in (200, 201, 202):
+        return True, None
+
+    # Capture the error body to help debugging (sender not verified, etc.)
+    err = resp.text.strip()
+    logger.error("Brevo send failed: status=%s body=%s", resp.status_code, err[:2000])
+    return False, f"Brevo error {resp.status_code}: {err[:500]}"
 @app.get("/health")
 def health() -> Dict[str, Any]:
     return {
@@ -425,6 +473,7 @@ async def generate_summary(
     summary = _openai_summarize(extracted, plan)
 
     email_sent = False
+    email_error: str | None = None
     if recipient_email:
         # Simple HTML email
         subject = f"Your {plan.capitalize()} Summary"
@@ -434,8 +483,8 @@ async def generate_summary(
           <pre style="white-space:pre-wrap; font-family: Arial, sans-serif">{summary}</pre>
         </div>
         """
-        _brevo_send_email(recipient_email, subject, html)
-        email_sent = True
+        email_sent, email_error = _brevo_send_email(to_email=recipient_email, subject=subject, html=html)
+        # email_sent already set from result
 
     return JSONResponse(
         {
@@ -444,6 +493,7 @@ async def generate_summary(
             "plan": plan,
             "summary": summary,
             "email_sent": email_sent,
+            "email_error": email_error,
             "recipient_email": recipient_email,
         }
     )
