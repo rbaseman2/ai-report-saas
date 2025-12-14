@@ -2,11 +2,13 @@ fastapi>=0.115
 uvicorn[standard]>=0.30
 stripe>=10.0
 requests>=2.31
-openai>=1.0.0 
+openai>=1.0.0
 python-multipart>=0.0.9
-
 
 # --- DB ---
 SQLAlchemy>=2.0
 email-validator
 pydantic
+
+# --- PDF support ---
+pypdf>=4.0.0
