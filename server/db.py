@@ -1,40 +1,35 @@
 # server/db.py
+from __future__ import annotations
+
 import os
-from sqlalchemy import create_engine, text
+from typing import AsyncGenerator
 
-# Render provides postgresql://, older libs sometimes still use postgres://
-DATABASE_URL = os.environ["DATABASE_URL"].replace("postgres://", "postgresql://")
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
-# Keep pre_ping True so broken idle connections are refreshed
-engine = create_engine(DATABASE_URL, pool_pre_ping=True)
+DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
 
-# Create the tables we need if they don't exist
-_DDL = """
-CREATE TABLE IF NOT EXISTS stripe_events (
-  id          BIGSERIAL PRIMARY KEY,
-  event_id    TEXT UNIQUE NOT NULL,
-  type        TEXT NOT NULL,
-  created_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
-  payload     JSONB NOT NULL
-);
+if not DATABASE_URL:
+    raise RuntimeError("DATABASE_URL is not set")
 
-CREATE TABLE IF NOT EXISTS subscriptions (
-  id                   BIGSERIAL PRIMARY KEY,
-  customer_id          TEXT NOT NULL,
-  email                TEXT,
-  subscription_id      TEXT UNIQUE NOT NULL,
-  price_id             TEXT,
-  status               TEXT,
-  current_period_end   TIMESTAMPTZ
-);
-"""
+# IMPORTANT: must be asyncpg for async SQLAlchemy
+# Example:
+# postgresql+asyncpg://user:pass@host:5432/dbname?ssl=require
+if DATABASE_URL.startswith("postgresql+psycopg://"):
+    raise RuntimeError(
+        "DATABASE_URL is using psycopg. For async SQLAlchemy use: postgresql+asyncpg://..."
+    )
 
-def create_tables() -> None:
-    # Run all DDL in a single transaction
-    with engine.begin() as conn:
-        conn.execute(text(_DDL))
+engine = create_async_engine(
+    DATABASE_URL,
+    pool_pre_ping=True,
+)
 
-# Quick connectivity test. You'll see 'Database connection successful' in logs.
-def ping() -> None:
-    with engine.connect() as conn:
-        conn.execute(text("SELECT 1"))
+SessionLocal = async_sessionmaker(
+    bind=engine,
+    class_=AsyncSession,
+    expire_on_commit=False,
+)
+
+async def get_session() -> AsyncGenerator[AsyncSession, None]:
+    async with SessionLocal() as session:
+        yield session

@@ -1,499 +1,337 @@
-"""
-server/webhook.py
-
-Single-file FastAPI backend for:
-- Stripe checkout session creation (with coupon/promo code box enabled)
-- Stripe webhook processing (subscription activation/cancellation)
-- Subscription status lookup by billing email
-- Generate summary endpoint that accepts multipart/form-data (file + fields)
-  NOTE: This fixes the UnicodeDecodeError caused by trying to parse multipart as JSON.
-"""
+# server/webhook.py
 from __future__ import annotations
 
 import os
 import json
-import time
-from typing import Optional, Dict, Any, Tuple
+import logging
+from datetime import datetime, timezone
+from typing import Optional, Dict, Any
 
-from fastapi import FastAPI, Request, HTTPException, UploadFile, File, Form, Query
-from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
 import stripe
-import requests
+from fastapi import FastAPI, Request, HTTPException, Depends
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel, EmailStr, Field
+from sqlalchemy import select, update
+from sqlalchemy.ext.asyncio import AsyncSession
 
-# Optional dependencies for document parsing
-try:
-    from pypdf import PdfReader  # type: ignore
-except Exception:
-    PdfReader = None  # type: ignore
+from .db import get_session
+from .models import User, Subscription, Summary
 
-try:
-    import docx  # python-docx
-except Exception:
-    docx = None  # type: ignore
+logger = logging.getLogger("ai-report-backend")
+logging.basicConfig(level=logging.INFO)
 
-
-# -----------------------------
-# Config
-# -----------------------------
-def _env(*names: str, default: Optional[str] = None) -> Optional[str]:
-    for n in names:
-        v = os.getenv(n)
-        if v is not None and str(v).strip() != "":
-            return v
-    return default
-
-
-STRIPE_SECRET_KEY = _env("STRIPE_SECRET_KEY", "STRIPE_API_KEY", "STRIPE_KEY")
-STRIPE_WEBHOOK_SECRET = _env("STRIPE_WEBHOOK_SECRET", "STRIPE_ENDPOINT_SECRET")
-
-PRICE_BASIC = _env("STRIPE_PRICE_BASIC")
-PRICE_PRO = _env("STRIPE_PRICE_PRO")
-PRICE_ENTERPRISE = _env("STRIPE_PRICE_ENTERPRISE")
-
-FRONTEND_URL = _env("FRONTEND_URL", default="http://localhost:8501")
-CANCEL_URL = _env("CANCEL_URL", default=FRONTEND_URL)
-
-OPENAI_API_KEY = _env("OPENAI_API_KEY")
-BREVO_API_KEY = _env("BREVO_API_KEY")
-EMAIL_FROM = _env("EMAIL_FROM")  # must be a verified sender in Brevo
-
-if not STRIPE_SECRET_KEY:
-    # We don't crash hard at import time; some endpoints can still respond with helpful errors.
-    stripe.api_key = ""
-else:
-    stripe.api_key = STRIPE_SECRET_KEY
-
-
-PLAN_BY_PRICE: Dict[str, str] = {}
-if PRICE_BASIC:
-    PLAN_BY_PRICE[PRICE_BASIC] = "basic"
-if PRICE_PRO:
-    PLAN_BY_PRICE[PRICE_PRO] = "pro"
-if PRICE_ENTERPRISE:
-    PLAN_BY_PRICE[PRICE_ENTERPRISE] = "enterprise"
-
-CHAR_LIMITS = {
-    "basic": 400_000,        # aligns with your UI copy
-    "pro": 1_500_000,
-    "enterprise": 5_000_000,
-}
-
-
-# -----------------------------
-# App + CORS
-# -----------------------------
 app = FastAPI()
 
-# Allow your Streamlit frontend to call the API.
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[FRONTEND_URL, "https://ai-report-saas.onrender.com", "https://ai-report-saas.onrender.com/"],
+    allow_origins=["*"],  # tighten later
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
+# ----------------------------
+# ENV
+# ----------------------------
+STRIPE_SECRET_KEY = os.getenv("STRIPE_SECRET_KEY", "").strip()
+STRIPE_WEBHOOK_SECRET = os.getenv("STRIPE_WEBHOOK_SECRET", "").strip()
 
-# -----------------------------
-# Helpers
-# -----------------------------
-def _require_stripe_config() -> None:
-    if not STRIPE_SECRET_KEY:
-        raise HTTPException(status_code=500, detail="Stripe is not configured (missing STRIPE_SECRET_KEY).")
-    if not (PRICE_BASIC and PRICE_PRO and PRICE_ENTERPRISE):
-        raise HTTPException(
-            status_code=500,
-            detail="Stripe price IDs are not configured (missing STRIPE_PRICE_BASIC/PRO/ENTERPRISE).",
-        )
+STRIPE_PRICE_BASIC = os.getenv("STRIPE_PRICE_BASIC", "").strip()
+STRIPE_PRICE_PRO = os.getenv("STRIPE_PRICE_PRO", "").strip()
+STRIPE_PRICE_ENTERPRISE = os.getenv("STRIPE_PRICE_ENTERPRISE", "").strip()
+
+SUCCESS_URL = os.getenv("SUCCESS_URL", "").strip()
+CANCEL_URL = os.getenv("CANCEL_URL", "").strip()
+
+stripe.api_key = STRIPE_SECRET_KEY
+
+PRICE_TO_PLAN = {
+    STRIPE_PRICE_BASIC: "basic",
+    STRIPE_PRICE_PRO: "pro",
+    STRIPE_PRICE_ENTERPRISE: "enterprise",
+}
+
+# ----------------------------
+# Helpers (DB)
+# ----------------------------
+async def get_or_create_user(session: AsyncSession, email: str) -> User:
+    email_norm = email.strip().lower()
+    res = await session.execute(select(User).where(User.email == email_norm))
+    user = res.scalar_one_or_none()
+    if user:
+        return user
+
+    user = User(email=email_norm)  # id is generated by DB default gen_random_uuid()
+    session.add(user)
+    await session.flush()  # populate user.id
+    return user
 
 
-def _safe_email(s: Optional[str]) -> Optional[str]:
-    if not s:
+def to_dt_from_unix(ts: Optional[int]) -> Optional[datetime]:
+    if not ts:
         return None
-    s = s.strip()
-    return s if "@" in s and "." in s else None
+    return datetime.fromtimestamp(int(ts), tz=timezone.utc)
 
 
-def _extract_text_from_upload(upload: UploadFile) -> str:
-    """
-    Extract plain text from supported file types.
-    Keeps it simple and safe; if parsing libs are missing, we fail with a clear message.
-    """
-    filename = (upload.filename or "").lower()
-    content = upload.file.read()  # bytes
-    upload.file.close()
-
-    # TXT / MD / CSV
-    if filename.endswith((".txt", ".md", ".csv")):
-        # Replace invalid bytes rather than failing.
-        return content.decode("utf-8", errors="replace")
-
-    # PDF
-    if filename.endswith(".pdf"):
-        # Try multiple extractors so production doesn't depend on a single optional package.
-        # 1) pypdf (preferred for simple text PDFs)
-        if PdfReader is not None:
-            try:
-                import io
-                reader = PdfReader(io.BytesIO(content))
-                chunks = []
-                for p in reader.pages:
-                    try:
-                        chunks.append(p.extract_text() or "")
-                    except Exception:
-                        chunks.append("")
-                text = "\n".join(chunks).strip()
-                if text:
-                    return text
-            except Exception:
-                # fall through to other extractors
-                pass
-
-        # 2) pdfminer.six (good fallback, pure python)
-        try:
-            import io
-            from pdfminer.high_level import extract_text as _pdfminer_extract_text  # type: ignore
-            text = _pdfminer_extract_text(io.BytesIO(content)) or ""
-            text = text.strip()
-            if text:
-                return text
-        except Exception:
-            pass
-
-        # 3) PyMuPDF / fitz (often works well on tricky PDFs)
-        try:
-            import fitz  # type: ignore
-            doc = fitz.open(stream=content, filetype="pdf")
-            chunks = []
-            for page in doc:
-                try:
-                    chunks.append(page.get_text() or "")
-                except Exception:
-                    chunks.append("")
-            text = "\n".join(chunks).strip()
-            if text:
-                return text
-        except Exception:
-            pass
-
-        raise HTTPException(
-            status_code=500,
-            detail="PDF text extraction not available. Add 'pypdf' (recommended) or 'pdfminer.six' or 'pymupdf' to requirements.txt."
-        )
-
-# DOCX
-    if filename.endswith(".docx"):
-        if docx is None:
-            raise HTTPException(status_code=500, detail="DOCX support not installed (missing python-docx).")
-        try:
-            import io
-            f = io.BytesIO(content)
-            d = docx.Document(f)
-            return "\n".join(p.text for p in d.paragraphs).strip()
-        except HTTPException:
-            raise
-        except Exception as e:
-            raise HTTPException(status_code=400, detail=f"Could not read DOCX: {e}")
-
-    raise HTTPException(status_code=400, detail="Unsupported file type. Use TXT, MD, PDF, DOCX, or CSV.")
+# ----------------------------
+# API Models
+# ----------------------------
+class CheckoutRequest(BaseModel):
+    email: EmailStr
+    plan: str = Field(..., description="basic|pro|enterprise")
 
 
-def _stripe_find_customer_id_by_email(email: str) -> Optional[str]:
-    _require_stripe_config()
-    res = stripe.Customer.list(email=email, limit=1)
-    if res and res.data:
-        return res.data[0].id
-    return None
+class CheckoutResponse(BaseModel):
+    url: str
+    session_id: str
 
 
-def _stripe_get_plan_for_email(email: str) -> Tuple[str, Optional[str]]:
-    """
-    Returns (status, plan) where:
-      status: 'active' | 'trialing' | 'past_due' | 'canceled' | 'none'
-      plan:   'basic' | 'pro' | 'enterprise' | None
-    """
-    _require_stripe_config()
-
-    customer_id = _stripe_find_customer_id_by_email(email)
-    if not customer_id:
-        return ("none", None)
-
-    subs = stripe.Subscription.list(
-        customer=customer_id,
-        status="all",
-        limit=10,
-        expand=["data.items.data.price"],
-    )
-    if not subs or not subs.data:
-        return ("none", None)
-
-    # Prefer an active or trialing sub; otherwise pick the newest.
-    preferred = None
-    for s in subs.data:
-        if s.status in ("active", "trialing"):
-            preferred = s
-            break
-    if preferred is None:
-        preferred = sorted(subs.data, key=lambda x: getattr(x, "created", 0), reverse=True)[0]
-
-    plan = None
-    try:
-        price_id = preferred["items"]["data"][0]["price"]["id"]
-        plan = PLAN_BY_PRICE.get(price_id)
-    except Exception:
-        plan = None
-
-    return (preferred.status or "none", plan)
+class GenerateSummaryRequest(BaseModel):
+    email: EmailStr
+    input_type: str = Field(..., description="pdf|text|docx|other")
+    input_name: Optional[str] = None
+    text: str = Field(..., description="Raw extracted text (or user-entered)")
+    summary_text: str = Field(..., description="The final summary you produced")
+    tokens_used: int = 0
 
 
-def _openai_summarize(text: str, plan: str) -> str:
-    if not OPENAI_API_KEY:
-        raise HTTPException(status_code=500, detail="OpenAI is not configured (missing OPENAI_API_KEY).")
-
-    # Keep request minimal; uses OpenAI responses via HTTPS (no SDK dependency required).
-    # If you use a different model name, update here.
-    model = _env("OPENAI_MODEL", default="gpt-4o-mini")
-
-    if plan == "enterprise":
-        instructions = (
-            "Create an enterprise-grade document summary with:\n"
-            "- Executive summary\n"
-            "- Key findings (bullets)\n"
-            "- Risks / red flags\n"
-            "- Recommended next steps\n"
-            "- Plain-language explanation for a non-expert\n"
-            "Be accurate and avoid leaking personal identifiers unless relevant."
-        )
-    elif plan == "pro":
-        instructions = (
-            "Create a professional summary with:\n"
-            "- Summary\n"
-            "- Key points\n"
-            "- Action items\n"
-            "Be concise but thorough."
-        )
-    else:
-        instructions = (
-            "Create a brief, clear summary with:\n"
-            "- Summary\n"
-            "- 3–5 key takeaways\n"
-        )
-
-    payload = {
-        "model": model,
-        "messages": [
-            {"role": "system", "content": instructions},
-            {"role": "user", "content": text[:2000000]},  # guard huge payloads
-        ],
-        "temperature": 0.2,
-    }
-
-    r = requests.post(
-        "https://api.openai.com/v1/chat/completions",
-        headers={"Authorization": f"Bearer {OPENAI_API_KEY}", "Content-Type": "application/json"},
-        data=json.dumps(payload),
-        timeout=90,
-    )
-    if r.status_code >= 300:
-        raise HTTPException(status_code=500, detail=f"OpenAI error: {r.status_code} {r.text[:500]}")
-    data = r.json()
-    try:
-        return data["choices"][0]["message"]["content"].strip()
-    except Exception:
-        raise HTTPException(status_code=500, detail="OpenAI response parsing failed.")
-
-
-def _brevo_send_email(*, to_email: str, subject: str, html: str) -> tuple[bool, str | None]:
-    """Send an email via Brevo Transactional API.
-
-    Returns: (sent_ok, error_message)
-    """
-    api_key = os.getenv("BREVO_API_KEY") or os.getenv("SENDINBLUE_API_KEY")  # allow old env name
-    sender_email = os.getenv("EMAIL_FROM") or os.getenv("BREVO_SENDER_EMAIL")
-    sender_name = os.getenv("EMAIL_FROM_NAME") or os.getenv("BREVO_SENDER_NAME") or "AI Report"
-    if not api_key:
-        return False, "BREVO_API_KEY is not set"
-    if not sender_email:
-        return False, "EMAIL_FROM is not set"
-
-    url = "https://api.brevo.com/v3/smtp/email"
-    headers = {
-        "accept": "application/json",
-        "api-key": api_key,
-        "content-type": "application/json",
-    }
-    payload = {
-        "sender": {"name": sender_name, "email": sender_email},
-        "to": [{"email": to_email}],
-        "subject": subject,
-        "htmlContent": html,
-    }
-
-    try:
-        resp = requests.post(url, headers=headers, json=payload, timeout=20)
-    except Exception as e:
-        logger.exception("Brevo send failed (request error)")
-        return False, f"Brevo request error: {e}"
-
-    # Brevo commonly returns 201 on success.
-    if resp.status_code in (200, 201, 202):
-        return True, None
-
-    # Capture the error body to help debugging (sender not verified, etc.)
-    err = resp.text.strip()
-    logger.error("Brevo send failed: status=%s body=%s", resp.status_code, err[:2000])
-    return False, f"Brevo error {resp.status_code}: {err[:500]}"
+# ----------------------------
+# Routes
+# ----------------------------
 @app.get("/health")
-def health() -> Dict[str, Any]:
-    return {
-        "ok": True,
-        "stripe_configured": bool(STRIPE_SECRET_KEY),
-        "prices_configured": bool(PRICE_BASIC and PRICE_PRO and PRICE_ENTERPRISE),
-        "openai_configured": bool(OPENAI_API_KEY),
-        "email_configured": bool(BREVO_API_KEY and EMAIL_FROM),
-        "ts": int(time.time()),
-    }
+async def health():
+    return {"ok": True}
 
 
-@app.get("/subscription-status")
-def subscription_status(email: str = Query(...)) -> Dict[str, Any]:
-    email = (email or "").strip()
-    if not email:
-        raise HTTPException(status_code=400, detail="Email is required.")
-    status, plan = _stripe_get_plan_for_email(email)
-    return {"email": email, "status": status, "plan": plan}
+@app.post("/create-checkout-session", response_model=CheckoutResponse)
+async def create_checkout_session(
+    payload: CheckoutRequest,
+    session: AsyncSession = Depends(get_session),
+):
+    if not STRIPE_SECRET_KEY:
+        raise HTTPException(status_code=500, detail="STRIPE_SECRET_KEY not set")
 
-
-@app.post("/create-checkout-session")
-async def create_checkout_session(request: Request) -> Dict[str, Any]:
-    """
-    Expects JSON: { "email": "...", "plan": "basic|pro|enterprise" }
-    Returns: { "url": "https://checkout.stripe.com/..." }
-    """
-    _require_stripe_config()
-
-    try:
-        body = await request.json()
-    except Exception:
-        raise HTTPException(status_code=400, detail="Invalid JSON.")
-
-    email = _safe_email(body.get("email"))
-    plan = (body.get("plan") or "").strip().lower()
-
-    if not email:
-        raise HTTPException(status_code=400, detail="Valid email is required.")
-    if plan not in ("basic", "pro", "enterprise"):
-        raise HTTPException(status_code=400, detail="Plan must be basic, pro, or enterprise.")
-
-    price_id = {
-        "basic": PRICE_BASIC,
-        "pro": PRICE_PRO,
-        "enterprise": PRICE_ENTERPRISE,
-    }.get(plan)
+    plan = payload.plan.strip().lower()
+    price_id = None
+    if plan == "basic":
+        price_id = STRIPE_PRICE_BASIC
+    elif plan == "pro":
+        price_id = STRIPE_PRICE_PRO
+    elif plan == "enterprise":
+        price_id = STRIPE_PRICE_ENTERPRISE
 
     if not price_id:
-        raise HTTPException(status_code=500, detail="Price ID missing for selected plan.")
+        raise HTTPException(status_code=400, detail="Invalid plan or missing STRIPE_PRICE_*")
 
-    session = stripe.checkout.Session.create(
+    if not SUCCESS_URL or not CANCEL_URL:
+        raise HTTPException(status_code=500, detail="SUCCESS_URL / CANCEL_URL not set")
+
+    # ensure user exists in DB
+    user = await get_or_create_user(session, str(payload.email))
+    await session.commit()
+
+    checkout = stripe.checkout.Session.create(
         mode="subscription",
-        customer_email=email,
+        customer_email=str(payload.email),
+        allow_promotion_codes=True,  # enables coupon box
         line_items=[{"price": price_id, "quantity": 1}],
-        success_url=f"{FRONTEND_URL}/Billing?status=success&session_id={{CHECKOUT_SESSION_ID}}",
-        cancel_url=f"{CANCEL_URL}/Billing?status=cancel",
-        allow_promotion_codes=True,  # <-- coupon/promo code box
+        success_url=SUCCESS_URL,
+        cancel_url=CANCEL_URL,
+        metadata={
+            "user_id": str(user.id),
+            "email": str(payload.email).lower(),
+            "plan": plan,
+        },
     )
-    return {"url": session.url}
+
+    return CheckoutResponse(url=checkout.url, session_id=checkout.id)
 
 
-@app.post("/webhook")
-async def stripe_webhook(request: Request):
-    """
-    Stripe sends raw bytes; verify signature then process.
-    """
+@app.post("/stripe-webhook")
+async def stripe_webhook(
+    request: Request,
+    session: AsyncSession = Depends(get_session),
+):
+    if not STRIPE_WEBHOOK_SECRET:
+        raise HTTPException(status_code=500, detail="STRIPE_WEBHOOK_SECRET not set")
+
     payload = await request.body()
     sig = request.headers.get("stripe-signature")
-    if not STRIPE_WEBHOOK_SECRET:
-        raise HTTPException(status_code=500, detail="Missing STRIPE_WEBHOOK_SECRET.")
 
     try:
-        event = stripe.Webhook.construct_event(payload=payload, sig_header=sig, secret=STRIPE_WEBHOOK_SECRET)
+        event = stripe.Webhook.construct_event(payload, sig, STRIPE_WEBHOOK_SECRET)
     except Exception as e:
-        raise HTTPException(status_code=400, detail=f"Webhook signature verification failed: {e}")
+        raise HTTPException(status_code=400, detail=f"Webhook signature error: {e}")
 
-    # Minimal processing: you can persist subscription/customer mapping in DB if desired.
-    # For now, we just acknowledge.
-    return {"received": True, "type": event.get("type")}
+    event_type = event["type"]
+    obj = event["data"]["object"]
+
+    # ----------------------------
+    # checkout.session.completed (subscription created)
+    # ----------------------------
+    if event_type == "checkout.session.completed":
+        email = (obj.get("customer_details", {}) or {}).get("email") or obj.get("customer_email")
+        customer_id = obj.get("customer")
+        subscription_id = obj.get("subscription")
+        metadata = obj.get("metadata", {}) or {}
+
+        if not email:
+            logger.warning("checkout.session.completed missing email")
+            return {"received": True}
+
+        user = await get_or_create_user(session, email)
+
+        # Pull subscription details to capture price/status/period_end
+        sub = None
+        try:
+            if subscription_id:
+                sub = stripe.Subscription.retrieve(subscription_id)
+        except Exception:
+            logger.exception("Failed to retrieve subscription from Stripe")
+
+        price_id = None
+        status = None
+        current_period_end = None
+
+        if sub:
+            status = sub.get("status")
+            current_period_end = to_dt_from_unix(sub.get("current_period_end"))
+            items = (sub.get("items", {}) or {}).get("data", []) or []
+            if items and items[0].get("price"):
+                price_id = items[0]["price"].get("id")
+
+        plan = PRICE_TO_PLAN.get(price_id, (metadata.get("plan") or "unknown"))
+
+        # Upsert into your subscriptions table by subscription_id (you added unique constraint)
+        # NOTE: using ORM approach since ON CONFLICT is SQL-level
+        res = await session.execute(
+            select(Subscription).where(Subscription.subscription_id == str(subscription_id))
+        )
+        row = res.scalar_one_or_none()
+
+        if not row:
+            row = Subscription(
+                customer_id=str(customer_id) if customer_id else None,
+                email=str(email).lower(),
+                subscription_id=str(subscription_id) if subscription_id else None,
+                price_id=price_id,
+                status=status,
+                current_period_end=current_period_end,
+                user_id=str(user.id),
+            )
+            session.add(row)
+        else:
+            row.customer_id = str(customer_id) if customer_id else row.customer_id
+            row.email = str(email).lower()
+            row.price_id = price_id or row.price_id
+            row.status = status or row.status
+            row.current_period_end = current_period_end or row.current_period_end
+            row.user_id = str(user.id)
+
+        await session.commit()
+        return {"received": True}
+
+    # ----------------------------
+    # customer.subscription.updated / deleted
+    # ----------------------------
+    if event_type in ("customer.subscription.updated", "customer.subscription.deleted"):
+        subscription_id = obj.get("id")
+        customer_id = obj.get("customer")
+        status = obj.get("status")
+        current_period_end = to_dt_from_unix(obj.get("current_period_end"))
+
+        items = (obj.get("items", {}) or {}).get("data", []) or []
+        price_id = None
+        if items and items[0].get("price"):
+            price_id = items[0]["price"].get("id")
+
+        # update the subscriptions row if it exists
+        res = await session.execute(
+            select(Subscription).where(Subscription.subscription_id == str(subscription_id))
+        )
+        row = res.scalar_one_or_none()
+        if row:
+            row.customer_id = str(customer_id) if customer_id else row.customer_id
+            row.status = status or row.status
+            row.price_id = price_id or row.price_id
+            row.current_period_end = current_period_end or row.current_period_end
+            await session.commit()
+
+        return {"received": True}
+
+    # ignore other events
+    return {"received": True}
 
 
 @app.post("/generate-summary")
 async def generate_summary(
-    billing_email: str = Form(...),
-    recipient_email: Optional[str] = Form(None),
-    text: Optional[str] = Form(None),
-    file: Optional[UploadFile] = File(None),
+    payload: GenerateSummaryRequest,
+    session: AsyncSession = Depends(get_session),
 ):
     """
-    IMPORTANT:
-    This endpoint is called by Streamlit using requests.post(data=payload, files=files).
-    That is multipart/form-data, not JSON.
-    The previous implementation used `await request.json()` which caused:
-      UnicodeDecodeError: 'utf-8' codec can't decode byte ... (because the body includes binary PDF bytes)
-
-    This implementation accepts proper Form + File params.
+    This endpoint is mainly for *storing* the generated summary.
+    Your Streamlit app can:
+      1) generate summary text however it wants
+      2) POST it here to persist in Postgres
     """
-    billing_email = (billing_email or "").strip()
-    if not billing_email:
-        raise HTTPException(status_code=400, detail="billing_email is required.")
+    user = await get_or_create_user(session, str(payload.email))
 
-    recipient_email = _safe_email(recipient_email) if recipient_email else None
-
-    extracted = ""
-    if file is not None:
-        extracted = _extract_text_from_upload(file)
-    if text and text.strip():
-        # Manual text overrides/augments extracted content.
-        extracted = (extracted + "\n\n" + text.strip()).strip() if extracted else text.strip()
-
-    if not extracted:
-        raise HTTPException(status_code=400, detail="Provide a file or text to summarize.")
-
-    status, plan = _stripe_get_plan_for_email(billing_email)
-    # If no plan found but subscription exists, treat as lowest tier; you can change this behavior.
-    plan = plan or "basic"
-
-    # Enforce limits
-    limit = CHAR_LIMITS.get(plan, CHAR_LIMITS["basic"])
-    if len(extracted) > limit:
-        raise HTTPException(
-            status_code=413,
-            detail=f"Input too large for {plan} plan ({len(extracted):,} chars). Limit is {limit:,}.",
-        )
-
-    summary = _openai_summarize(extracted, plan)
-
-    email_sent = False
-    email_error: str | None = None
-    if recipient_email:
-        # Simple HTML email
-        subject = f"Your {plan.capitalize()} Summary"
-        html = f"""
-        <div style="font-family: Arial, sans-serif; line-height:1.4">
-          <h2>{subject}</h2>
-          <pre style="white-space:pre-wrap; font-family: Arial, sans-serif">{summary}</pre>
-        </div>
-        """
-        email_sent, email_error = _brevo_send_email(to_email=recipient_email, subject=subject, html=html)
-        # email_sent already set from result
-
-    return JSONResponse(
-        {
-            "status": "ok",
-            "subscription_status": status,
-            "plan": plan,
-            "summary": summary,
-            "email_sent": email_sent,
-            "email_error": email_error,
-            "recipient_email": recipient_email,
-        }
+    # find latest subscription for this user (optional)
+    res = await session.execute(
+        select(Subscription)
+        .where(Subscription.user_id == str(user.id))
+        .order_by(Subscription.id.desc())
+        .limit(1)
     )
+    sub = res.scalar_one_or_none()
+
+    row = Summary(
+        user_id=str(user.id),
+        subscription_id=sub.id if sub else None,
+        input_type=payload.input_type,
+        input_name=payload.input_name,
+        summary_text=payload.summary_text,
+        tokens_used=int(payload.tokens_used or 0),
+    )
+    session.add(row)
+    await session.commit()
+
+    return {
+        "ok": True,
+        "user_id": str(user.id),
+        "subscription_id": sub.subscription_id if sub else None,
+    }
+
+
+@app.get("/subscription-status")
+async def subscription_status(email: EmailStr, session: AsyncSession = Depends(get_session)):
+    email_norm = str(email).strip().lower()
+
+    res = await session.execute(select(User).where(User.email == email_norm))
+    user = res.scalar_one_or_none()
+    if not user:
+        return {"email": email_norm, "has_active_subscription": False, "status": "none", "plan": "none"}
+
+    res = await session.execute(
+        select(Subscription)
+        .where(Subscription.user_id == str(user.id))
+        .order_by(Subscription.id.desc())
+        .limit(1)
+    )
+    sub = res.scalar_one_or_none()
+    if not sub:
+        return {"email": email_norm, "has_active_subscription": False, "status": "none", "plan": "none"}
+
+    plan = PRICE_TO_PLAN.get(sub.price_id or "", "unknown")
+    has_active = (sub.status == "active")
+
+    return {
+        "email": email_norm,
+        "has_active_subscription": has_active,
+        "plan": plan,
+        "status": sub.status,
+        "current_period_end": int(sub.current_period_end.timestamp()) if sub.current_period_end else None,
+        "stripe_customer_id": sub.customer_id,
+        "stripe_subscription_id": sub.subscription_id,
+        "user_id": sub.user_id,
+    }
