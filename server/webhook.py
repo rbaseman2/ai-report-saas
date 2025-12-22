@@ -4,7 +4,7 @@ from __future__ import annotations
 import os
 import logging
 from datetime import datetime, timezone
-from typing import Optional, Tuple
+from typing import Optional
 
 import stripe
 from fastapi import FastAPI, Request, HTTPException, Depends
@@ -42,24 +42,21 @@ STRIPE_PRICE_ENTERPRISE = os.getenv("STRIPE_PRICE_ENTERPRISE", "").strip()
 SUCCESS_URL = os.getenv("SUCCESS_URL", "").strip()
 CANCEL_URL = os.getenv("CANCEL_URL", "").strip()
 
-if not STRIPE_SECRET_KEY:
-    logger.warning("STRIPE_SECRET_KEY is not set")
-
 stripe.api_key = STRIPE_SECRET_KEY
 
-# Correct mappings
+# Plan <-> Price mappings
 PLAN_TO_PRICE = {
     "basic": STRIPE_PRICE_BASIC,
     "pro": STRIPE_PRICE_PRO,
     "enterprise": STRIPE_PRICE_ENTERPRISE,
 }
+
 PRICE_TO_PLAN = {
     STRIPE_PRICE_BASIC: "basic",
     STRIPE_PRICE_PRO: "pro",
     STRIPE_PRICE_ENTERPRISE: "enterprise",
 }
 
-ACTIVE_STATUSES = {"active", "trialing"}
 
 # ----------------------------
 # Helpers
@@ -79,27 +76,8 @@ async def get_or_create_user(session: AsyncSession, email: str) -> User:
 
     user = User(email=email_norm)
     session.add(user)
-    await session.flush()  # assign id
+    await session.flush()
     return user
-
-
-async def resolve_customer_email(customer_id: Optional[str], fallback_email: Optional[str]) -> Optional[str]:
-    """
-    Stripe webhook events don't always include customer_email.
-    Use fallback if present; otherwise look it up via Stripe Customer.
-    """
-    if fallback_email:
-        return fallback_email.strip().lower()
-    if not customer_id:
-        return None
-
-    try:
-        cust = stripe.Customer.retrieve(customer_id)
-        email = (cust.get("email") or "").strip().lower()
-        return email or None
-    except Exception:
-        logger.exception("Failed to retrieve Stripe customer to resolve email")
-        return None
 
 
 async def upsert_subscription(
@@ -114,22 +92,28 @@ async def upsert_subscription(
 ):
     """
     Single safe helper used by Stripe webhooks.
+    Upserts the subscription row keyed by subscription_id.
     """
-    email_norm = email.strip().lower()
-    user = await get_or_create_user(session, email_norm)
+    if not email:
+        return
+
+    user = await get_or_create_user(session, email)
+
+    # subscription_id can be None in edge cases; handle gracefully
+    sub_id = str(subscription_id) if subscription_id else None
 
     row = None
-    if subscription_id:
+    if sub_id:
         res = await session.execute(
-            select(Subscription).where(Subscription.subscription_id == subscription_id)
+            select(Subscription).where(Subscription.subscription_id == sub_id)
         )
         row = res.scalar_one_or_none()
 
     if not row:
         row = Subscription(
-            email=email_norm,
-            customer_id=customer_id,
-            subscription_id=subscription_id,
+            email=str(email).strip().lower(),
+            customer_id=str(customer_id) if customer_id else None,
+            subscription_id=sub_id,
             price_id=price_id,
             status=status,
             current_period_end=current_period_end,
@@ -137,8 +121,8 @@ async def upsert_subscription(
         )
         session.add(row)
     else:
-        row.email = email_norm
-        row.customer_id = customer_id or row.customer_id
+        row.email = str(email).strip().lower()
+        row.customer_id = str(customer_id) if customer_id else row.customer_id
         row.price_id = price_id or row.price_id
         row.status = status or row.status
         row.current_period_end = current_period_end or row.current_period_end
@@ -147,43 +131,53 @@ async def upsert_subscription(
     await session.commit()
 
 
-async def get_latest_subscription(
+# ✅ Single helper you asked for (used by subscription-status and anywhere else later)
+async def get_latest_subscription_for_email(
     session: AsyncSession, email: str
-) -> Tuple[Optional[Subscription], Optional[str]]:
+) -> Optional[Subscription]:
     """
-    Returns (subscription_row, plan_name).
-    Preference order:
-      1) latest ACTIVE/TRIALING subscription
-      2) latest subscription of any status (for display/debug)
+    Returns the newest Subscription row for this user (by DB id desc),
+    or None if the user/subscription doesn't exist.
     """
-    user = await get_or_create_user(session, email)
+    email_norm = email.strip().lower()
 
-    # Try active/trialing first
+    res = await session.execute(select(User).where(User.email == email_norm))
+    user = res.scalar_one_or_none()
+    if not user:
+        return None
+
     res = await session.execute(
         select(Subscription)
         .where(Subscription.user_id == str(user.id))
-        .where(Subscription.status.in_(list(ACTIVE_STATUSES)))
         .order_by(Subscription.id.desc())
         .limit(1)
     )
-    sub = res.scalar_one_or_none()
-    if sub:
-        plan = PRICE_TO_PLAN.get(sub.price_id or "", "unknown")
-        return sub, plan
+    return res.scalar_one_or_none()
 
-    # Fallback: latest of any status
-    res2 = await session.execute(
-        select(Subscription)
-        .where(Subscription.user_id == str(user.id))
-        .order_by(Subscription.id.desc())
-        .limit(1)
-    )
-    sub2 = res2.scalar_one_or_none()
-    if sub2:
-        plan2 = PRICE_TO_PLAN.get(sub2.price_id or "", "unknown")
-        return sub2, plan2
 
-    return None, None
+def plan_from_price_id(price_id: Optional[str]) -> str:
+    if not price_id:
+        return "none"
+    return PRICE_TO_PLAN.get(price_id, "none")
+
+
+def is_active_status(status: Optional[str]) -> bool:
+    # treat trialing as active for gating access
+    return (status or "").lower() in ("active", "trialing")
+
+
+def extract_email_from_checkout_session(obj: dict) -> Optional[str]:
+    # Stripe may put email in different places depending on flow
+    email = obj.get("customer_email")
+    if email:
+        return str(email).strip().lower()
+
+    customer_details = obj.get("customer_details") or {}
+    email2 = customer_details.get("email")
+    if email2:
+        return str(email2).strip().lower()
+
+    return None
 
 
 # ----------------------------
@@ -197,15 +191,6 @@ class CheckoutRequest(BaseModel):
 class CheckoutResponse(BaseModel):
     url: str
     session_id: str
-
-
-class SubscriptionStatusResponse(BaseModel):
-    email: EmailStr
-    has_active_subscription: bool
-    plan: Optional[str] = None
-    status: Optional[str] = None
-    price_id: Optional[str] = None
-    current_period_end: Optional[str] = None
 
 
 class GenerateSummaryRequest(BaseModel):
@@ -234,44 +219,31 @@ async def create_checkout_session(
     price_id = PLAN_TO_PRICE.get(plan)
 
     if not price_id:
-        raise HTTPException(status_code=400, detail="Invalid plan (basic|pro|enterprise)")
+        raise HTTPException(status_code=400, detail="Invalid plan. Use basic|pro|enterprise")
 
+    # Ensure user exists in DB
     user = await get_or_create_user(session, str(payload.email))
     await session.commit()
 
+    # ✅ Coupon box on hosted checkout
     checkout = stripe.checkout.Session.create(
         mode="subscription",
         customer_email=str(payload.email),
-        allow_promotion_codes=True,  # keep coupon box
+        allow_promotion_codes=True,
         line_items=[{"price": price_id, "quantity": 1}],
         success_url=SUCCESS_URL,
         cancel_url=CANCEL_URL,
         metadata={"user_id": str(user.id), "plan": plan},
     )
 
-    logger.info("Created checkout session %s for plan %s and email %s", checkout.id, plan, payload.email)
-    return CheckoutResponse(url=checkout.url, session_id=checkout.id)
-
-
-@app.get("/subscription-status", response_model=SubscriptionStatusResponse)
-async def subscription_status(
-    email: EmailStr,
-    session: AsyncSession = Depends(get_session),
-):
-    email_norm = str(email).strip().lower()
-    sub, plan = await get_latest_subscription(session, email_norm)
-
-    has_active = bool(sub and (sub.status in ACTIVE_STATUSES))
-    cpe = sub.current_period_end.isoformat() if (sub and sub.current_period_end) else None
-
-    return SubscriptionStatusResponse(
-        email=email_norm,
-        has_active_subscription=has_active,
-        plan=plan if sub else None,
-        status=sub.status if sub else None,
-        price_id=sub.price_id if sub else None,
-        current_period_end=cpe,
+    logger.info(
+        "Created checkout session %s for plan %s and email %s",
+        checkout.id,
+        plan,
+        str(payload.email),
     )
+
+    return CheckoutResponse(url=checkout.url, session_id=checkout.id)
 
 
 @app.post("/stripe-webhook")
@@ -279,8 +251,13 @@ async def stripe_webhook(
     request: Request,
     session: AsyncSession = Depends(get_session),
 ):
+    if not STRIPE_WEBHOOK_SECRET:
+        raise HTTPException(status_code=500, detail="Missing STRIPE_WEBHOOK_SECRET")
+
     payload = await request.body()
     sig = request.headers.get("stripe-signature")
+    if not sig:
+        raise HTTPException(status_code=400, detail="Missing stripe-signature header")
 
     try:
         event = stripe.Webhook.construct_event(payload, sig, STRIPE_WEBHOOK_SECRET)
@@ -288,74 +265,83 @@ async def stripe_webhook(
         logger.exception("Stripe webhook signature verification failed")
         raise HTTPException(status_code=400, detail="Invalid signature")
 
-    obj = event["data"]["object"]
-    event_type = event.get("type")
+    event_type = event.get("type", "")
+    obj = (event.get("data") or {}).get("object") or {}
 
-    try:
-        if event_type == "checkout.session.completed":
-            # checkout session includes subscription + customer; email is often present
-            customer_id = obj.get("customer")
-            subscription_id = obj.get("subscription")
-            email = await resolve_customer_email(customer_id, obj.get("customer_email"))
+    # ----------------------------
+    # checkout.session.completed
+    # ----------------------------
+    if event_type == "checkout.session.completed":
+        email = extract_email_from_checkout_session(obj)
+        subscription_id = obj.get("subscription")
+        customer_id = obj.get("customer")
 
-            if not email or not subscription_id:
-                logger.warning("Missing email or subscription_id in checkout.session.completed")
-                return {"received": True}
+        if not email:
+            logger.warning("checkout.session.completed missing email; ignoring")
+            return {"received": True}
 
-            sub = stripe.Subscription.retrieve(subscription_id, expand=["items.data.price"])
-            price_id = sub["items"]["data"][0]["price"]["id"]
-            status = sub.get("status")
-            current_period_end = to_dt_from_unix(sub.get("current_period_end"))
+        # Pull subscription details to capture price/status/period_end
+        price_id = None
+        status = None
+        current_period_end = None
 
-            await upsert_subscription(
-                session,
-                email=email,
-                customer_id=customer_id,
-                subscription_id=subscription_id,
-                price_id=price_id,
-                status=status,
-                current_period_end=current_period_end,
-            )
+        try:
+            if subscription_id:
+                sub = stripe.Subscription.retrieve(subscription_id)
+                status = sub.get("status")
+                current_period_end = to_dt_from_unix(sub.get("current_period_end"))
+                items = (sub.get("items", {}) or {}).get("data", []) or []
+                if items and (items[0].get("price") or {}).get("id"):
+                    price_id = items[0]["price"]["id"]
+        except Exception:
+            logger.exception("Failed to retrieve Stripe subscription for %s", subscription_id)
 
-        elif event_type in ("customer.subscription.updated", "customer.subscription.deleted"):
-            # Subscription object typically has customer but not customer_email
-            customer_id = obj.get("customer")
-            email = await resolve_customer_email(customer_id, None)
+        await upsert_subscription(
+            session,
+            email=email,
+            customer_id=str(customer_id) if customer_id else None,
+            subscription_id=str(subscription_id) if subscription_id else None,
+            price_id=price_id,
+            status=status,
+            current_period_end=current_period_end,
+        )
 
-            # If we cannot resolve email, we still store by subscription_id when possible,
-            # but your DB schema uses email+user_id; best effort requires email.
-            if not email:
-                logger.warning("Could not resolve email for subscription event %s (customer=%s)", event_type, customer_id)
-                return {"received": True}
-
-            price_id = None
-            try:
-                # items may not be expanded in webhook; be defensive
-                items = obj.get("items", {}).get("data", [])
-                if items and items[0].get("price"):
-                    price_id = items[0]["price"].get("id")
-                else:
-                    # retrieve to ensure price is available
-                    sub_full = stripe.Subscription.retrieve(obj.get("id"), expand=["items.data.price"])
-                    price_id = sub_full["items"]["data"][0]["price"]["id"]
-            except Exception:
-                logger.exception("Failed to resolve price_id for subscription event")
-
-            await upsert_subscription(
-                session,
-                email=email,
-                customer_id=customer_id,
-                subscription_id=obj.get("id"),
-                price_id=price_id,
-                status=obj.get("status"),
-                current_period_end=to_dt_from_unix(obj.get("current_period_end")),
-            )
-
-    except Exception:
-        logger.exception("Stripe webhook handling failed for event type %s", event_type)
-        # Return 200 so Stripe doesn't endlessly retry while you're iterating
         return {"received": True}
 
+    # ----------------------------
+    # customer.subscription.updated / deleted
+    # ----------------------------
+    if event_type in ("customer.subscription.updated", "customer.subscription.deleted"):
+        subscription_id = obj.get("id")
+        customer_id = obj.get("customer")
+        status = obj.get("status")
+        current_period_end = to_dt_from_unix(obj.get("current_period_end"))
+
+        # price id
+        price_id = None
+        items = (obj.get("items", {}) or {}).get("data", []) or []
+        if items and items[0].get("price"):
+            price_id = (items[0]["price"] or {}).get("id")
+
+        # We may not have email on these events; keep existing email in DB if present.
+        sub_id = str(subscription_id) if subscription_id else None
+        if not sub_id:
+            return {"received": True}
+
+        res = await session.execute(
+            select(Subscription).where(Subscription.subscription_id == sub_id)
+        )
+        row = res.scalar_one_or_none()
+        if row:
+            row.customer_id = str(customer_id) if customer_id else row.customer_id
+            row.status = status or row.status
+            row.price_id = price_id or row.price_id
+            row.current_period_end = current_period_end or row.current_period_end
+            await session.commit()
+
+        return {"received": True}
+
+    # ignore other events
     return {"received": True}
 
 
@@ -365,26 +351,64 @@ async def generate_summary(
     session: AsyncSession = Depends(get_session),
 ):
     """
-    Enforce subscription tiers (Step A):
-    - user must have an active/trialing subscription to generate a summary
-    - store the summary in DB with the subscription_id attached (if available)
+    This endpoint stores the generated summary into Postgres.
+    Your Streamlit app generates summary text and POSTs it here.
     """
-    email_norm = str(payload.email).strip().lower()
-    user = await get_or_create_user(session, email_norm)
+    user = await get_or_create_user(session, str(payload.email))
 
-    sub, plan = await get_latest_subscription(session, email_norm)
-    if not sub or sub.status not in ACTIVE_STATUSES:
-        raise HTTPException(status_code=403, detail="Active subscription required")
+    # latest subscription (optional)
+    res = await session.execute(
+        select(Subscription)
+        .where(Subscription.user_id == str(user.id))
+        .order_by(Subscription.id.desc())
+        .limit(1)
+    )
+    sub = res.scalar_one_or_none()
 
     row = Summary(
         user_id=str(user.id),
-        subscription_id=sub.id,
+        subscription_id=sub.id if sub else None,
         input_type=payload.input_type,
         input_name=payload.input_name,
         summary_text=payload.summary_text,
-        tokens_used=payload.tokens_used,
+        tokens_used=int(payload.tokens_used or 0),
     )
     session.add(row)
     await session.commit()
 
-    return {"ok": True, "plan": plan}
+    return {
+        "ok": True,
+        "user_id": str(user.id),
+        "subscription_id": sub.subscription_id if sub else None,
+    }
+
+
+@app.get("/subscription-status")
+async def subscription_status(email: EmailStr, session: AsyncSession = Depends(get_session)):
+    email_norm = str(email).strip().lower()
+
+    sub = await get_latest_subscription_for_email(session, email_norm)
+    if not sub:
+        return {
+            "email": email_norm,
+            "has_active_subscription": False,
+            "status": "none",
+            "plan": "none",
+            "current_period_end": None,
+            "stripe_customer_id": None,
+            "stripe_subscription_id": None,
+        }
+
+    status = (sub.status or "none").lower()
+    plan = plan_from_price_id(sub.price_id)
+
+    return {
+        "email": email_norm,
+        "has_active_subscription": is_active_status(status),
+        "plan": plan,
+        "status": status,
+        "current_period_end": int(sub.current_period_end.timestamp()) if sub.current_period_end else None,
+        "stripe_customer_id": sub.customer_id,
+        "stripe_subscription_id": sub.subscription_id,
+        "user_id": sub.user_id,
+    }

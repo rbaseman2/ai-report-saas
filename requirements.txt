@@ -9,6 +9,8 @@ python-multipart>=0.0.9
 SQLAlchemy>=2.0
 email-validator
 pydantic
+asyncpg>=0.29
+alembic>=1.13
 
 # --- PDF support ---
 pypdf>=4.0.0
