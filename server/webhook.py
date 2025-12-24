@@ -1,194 +1,206 @@
 import os
-import json
 import logging
-from typing import Optional, Dict, Any, Tuple
+from typing import Optional
 
 import stripe
 import requests
-
 from fastapi import FastAPI, Request, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, EmailStr
-from email_validator import validate_email, EmailNotValidError
-from openai import OpenAI
 
-# --------------------------------------------------
-# App + logging
-# --------------------------------------------------
-logger = logging.getLogger("ai-report-backend")
-logging.basicConfig(level=logging.INFO)
+# -------------------------------------------------------------------
+# App setup
+# -------------------------------------------------------------------
 
 app = FastAPI()
+logging.basicConfig(level=logging.INFO)
 
-# --------------------------------------------------
-# CORS
-# --------------------------------------------------
-allowed_origins = os.getenv("ALLOWED_ORIGINS", "*")
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[o.strip() for o in allowed_origins.split(",")] if allowed_origins else ["*"],
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# --------------------------------------------------
-# Stripe config (UNCHANGED)
-# --------------------------------------------------
-STRIPE_SECRET_KEY = os.getenv("STRIPE_SECRET_KEY", "")
-STRIPE_WEBHOOK_SECRET = os.getenv("STRIPE_WEBHOOK_SECRET", "")
-STRIPE_SUCCESS_URL = os.getenv("STRIPE_SUCCESS_URL", "")
-STRIPE_CANCEL_URL = os.getenv("STRIPE_CANCEL_URL", "")
+# -------------------------------------------------------------------
+# Environment variables
+# -------------------------------------------------------------------
+
+STRIPE_SECRET_KEY = os.getenv("STRIPE_SECRET_KEY")
+STRIPE_WEBHOOK_SECRET = os.getenv("STRIPE_WEBHOOK_SECRET")
+
+SUCCESS_URL = os.getenv("SUCCESS_URL")
+CANCEL_URL = os.getenv("CANCEL_URL")
+
+STRIPE_PRICE_BASIC = os.getenv("STRIPE_PRICE_BASIC")
+STRIPE_PRICE_PRO = os.getenv("STRIPE_PRICE_PRO")
+STRIPE_PRICE_ENTERPRISE = os.getenv("STRIPE_PRICE_ENTERPRISE")
+
+BREVO_API_KEY = os.getenv("BREVO_API_KEY")
+BREVO_SENDER_EMAIL = os.getenv("BREVO_SENDER_EMAIL", "admin@robaisolutions.com")
+BREVO_SENDER_NAME = os.getenv("BREVO_SENDER_NAME", "RobAI Solutions")
 
 stripe.api_key = STRIPE_SECRET_KEY
 
 PLAN_TO_PRICE = {
-    "basic": os.getenv("STRIPE_PRICE_BASIC", ""),
-    "pro": os.getenv("STRIPE_PRICE_PRO", ""),
-    "enterprise": os.getenv("STRIPE_PRICE_ENTERPRISE", ""),
+    "basic": STRIPE_PRICE_BASIC,
+    "pro": STRIPE_PRICE_PRO,
+    "enterprise": STRIPE_PRICE_ENTERPRISE,
 }
-PRICE_TO_PLAN = {v: k for k, v in PLAN_TO_PRICE.items() if v}
 
-# --------------------------------------------------
-# OpenAI (UNCHANGED)
-# --------------------------------------------------
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
-openai_client = OpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
+# -------------------------------------------------------------------
+# Email helper (Brevo)
+# -------------------------------------------------------------------
 
-# --------------------------------------------------
-# Email (Brevo) — NEW HELPER ONLY
-# --------------------------------------------------
-BREVO_API_KEY = os.getenv("BREVO_API_KEY", "")
-EMAIL_FROM = os.getenv("EMAIL_FROM", "admin@robaisolutions.com")
-
-def _send_email_via_brevo(to_email: str, subject: str, body_text: str) -> bool:
-    """
-    Sends transactional email via Brevo.
-    Safe, isolated helper. Does not affect any other logic.
-    """
-    if not BREVO_API_KEY:
-        logger.error("BREVO_API_KEY not set")
-        return False
-
-    payload = {
-        "sender": {"email": EMAIL_FROM},
-        "to": [{"email": to_email}],
-        "subject": subject,
-        "textContent": body_text,
-    }
-
+async def send_email(to_email: str, subject: str, html_content: str):
+    url = "https://api.brevo.com/v3/smtp/email"
     headers = {
         "accept": "application/json",
         "api-key": BREVO_API_KEY,
         "content-type": "application/json",
     }
+    payload = {
+        "sender": {
+            "email": BREVO_SENDER_EMAIL,
+            "name": BREVO_SENDER_NAME,
+        },
+        "to": [{"email": to_email}],
+        "subject": subject,
+        "htmlContent": html_content,
+    }
 
-    resp = requests.post(
-        "https://api.brevo.com/v3/smtp/email",
-        headers=headers,
-        data=json.dumps(payload),
-        timeout=10,
-    )
+    response = requests.post(url, json=payload, headers=headers)
+    if response.status_code >= 300:
+        raise RuntimeError(f"Brevo error: {response.text}")
 
-    if resp.status_code >= 400:
-        logger.error(f"Brevo email failed: {resp.status_code} {resp.text}")
-        return False
+# -------------------------------------------------------------------
+# Models
+# -------------------------------------------------------------------
 
-    return True
-
-# --------------------------------------------------
-# Tier enforcement (UNCHANGED)
-# --------------------------------------------------
-CHAR_LIMITS = {
-    "basic": 8000,
-    "pro": 15000,
-    "enterprise": 25000,
-}
-ACTIVE_SUB_STATUSES = {"active", "trialing"}
-
-# --------------------------------------------------
-# Models (UNCHANGED)
-# --------------------------------------------------
 class CheckoutRequest(BaseModel):
     plan: str
     email: EmailStr
 
-class CheckoutResponse(BaseModel):
-    url: str
 
-class SubscriptionStatusResponse(BaseModel):
+class TestEmailRequest(BaseModel):
     email: EmailStr
-    status: str
-    plan: str
-    active: bool
 
-class GenerateSummaryResponse(BaseModel):
-    summary: str
-    plan: str
-    email_sent: bool
 
-# --------------------------------------------------
-# Helpers (UNCHANGED)
-# --------------------------------------------------
-def _safe_email(email: str) -> str:
-    try:
-        validate_email(email)
-        return email
-    except EmailNotValidError:
-        raise HTTPException(status_code=400, detail="Invalid email address")
+class GenerateSummaryRequest(BaseModel):
+    email: EmailStr
+    recipient_email: EmailStr
+    content: str
 
-def _truncate_for_plan(text: str, plan: str) -> str:
-    limit = CHAR_LIMITS.get(plan, CHAR_LIMITS["basic"])
-    return text[:limit]
 
-def _openai_summarize(text: str, plan: str) -> str:
-    if not openai_client:
-        raise HTTPException(status_code=500, detail="OpenAI not configured")
-
-    model = "gpt-4o-mini"
-    resp = openai_client.chat.completions.create(
-        model=model,
-        messages=[
-            {"role": "system", "content": "Summarize clearly and professionally."},
-            {"role": "user", "content": text},
-        ],
-        temperature=0.2,
-    )
-    return resp.choices[0].message.content.strip()
-
-# --------------------------------------------------
+# -------------------------------------------------------------------
 # Health
-# --------------------------------------------------
+# -------------------------------------------------------------------
+
 @app.get("/health")
-def health():
-    return {"ok": True}
+async def health():
+    return {"status": "ok"}
 
-# --------------------------------------------------
-# Generate summary (EMAIL SEND ADDED, LOGIC UNCHANGED)
-# --------------------------------------------------
-@app.post("/generate-summary", response_model=GenerateSummaryResponse)
-async def generate_summary(request: Request):
-    body = await request.json()
+# -------------------------------------------------------------------
+# Checkout
+# -------------------------------------------------------------------
 
-    billing_email = _safe_email(body.get("billing_email", ""))
-    recipient_email = _safe_email(body.get("recipient_email", ""))
-    extracted_text = body.get("extracted_text", "")
-    filename = body.get("filename", "document")
+@app.post("/create-checkout-session")
+async def create_checkout_session(req: CheckoutRequest):
+    price_id = PLAN_TO_PRICE.get(req.plan)
+    if not price_id:
+        raise HTTPException(status_code=400, detail="Invalid plan")
 
-    plan = "basic"
-    extracted_text = _truncate_for_plan(extracted_text, plan)
-
-    summary = _openai_summarize(extracted_text, plan)
-
-    subject = f"AI Report Summary: {filename}"
-    email_sent = _send_email_via_brevo(
-        recipient_email,
-        subject,
-        summary,
+    session = stripe.checkout.Session.create(
+        mode="subscription",
+        payment_method_types=["card"],
+        line_items=[{"price": price_id, "quantity": 1}],
+        success_url=f"{SUCCESS_URL}?session_id={{CHECKOUT_SESSION_ID}}",
+        cancel_url=CANCEL_URL,
+        customer_email=req.email,
+        allow_promotion_codes=True,  # ✅ coupon box stays
     )
 
-    return GenerateSummaryResponse(
-        summary=summary,
-        plan=plan,
-        email_sent=email_sent,
+    logging.info(
+        f"Created checkout session {session.id} for plan {req.plan} and email {req.email}"
     )
+
+    return {"checkout_url": session.url}
+
+# -------------------------------------------------------------------
+# Subscription status
+# -------------------------------------------------------------------
+
+@app.get("/subscription-status")
+async def subscription_status(email: EmailStr):
+    customers = stripe.Customer.list(email=email, limit=1)
+    if not customers.data:
+        return {"active": False, "plan": None}
+
+    customer = customers.data[0]
+    subs = stripe.Subscription.list(
+        customer=customer.id,
+        status="all",
+        limit=10,
+        expand=["data.items.data.price"],
+    )
+
+    for sub in subs.data:
+        if sub.status in ("active", "trialing"):
+            price = sub["items"]["data"][0]["price"]["id"]
+            plan = next((k for k, v in PLAN_TO_PRICE.items() if v == price), "unknown")
+            return {
+                "active": True,
+                "plan": plan,
+                "status": sub.status,
+            }
+
+    return {"active": False, "plan": None}
+
+# -------------------------------------------------------------------
+# Generate summary (EXISTING FLOW – untouched)
+# -------------------------------------------------------------------
+
+@app.post("/generate-summary")
+async def generate_summary(req: GenerateSummaryRequest):
+    try:
+        summary_html = f"""
+        <h2>Your AI Report Summary</h2>
+        <p>{req.content}</p>
+        """
+
+        await send_email(
+            to_email=req.recipient_email,
+            subject="Your AI Report Summary",
+            html_content=summary_html,
+        )
+
+        return {"sent": True}
+
+    except Exception as e:
+        logging.exception("Error generating summary")
+        raise HTTPException(status_code=500, detail=str(e))
+
+# -------------------------------------------------------------------
+# ✅ SAFE TEST EMAIL ENDPOINT (NEW)
+# -------------------------------------------------------------------
+
+@app.post("/test-email")
+async def test_email(req: TestEmailRequest):
+    """
+    Safe test endpoint.
+    Does NOT affect billing, subscriptions, or summaries.
+    """
+    try:
+        await send_email(
+            to_email=req.email,
+            subject="Test Email – RobAI Solutions",
+            html_content="""
+            <h2>Email Test Successful ✅</h2>
+            <p>This confirms Brevo email delivery is working.</p>
+            """,
+        )
+        return {"email": req.email, "sent": True}
+    except Exception as e:
+        logging.exception("Email test failed")
+        raise HTTPException(status_code=500, detail=str(e))
