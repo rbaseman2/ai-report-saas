@@ -43,6 +43,8 @@ BREVO_API_KEY = os.getenv("BREVO_API_KEY")
 BREVO_SENDER_EMAIL = os.getenv("BREVO_SENDER_EMAIL", "admin@robaisolutions.com")
 BREVO_SENDER_NAME = os.getenv("BREVO_SENDER_NAME", "RobAI Solutions")
 
+stripe.api_key = STRIPE_SECRET_KEY
+
 PLAN_TO_PRICE = {
     "basic": STRIPE_PRICE_BASIC,
     "pro": STRIPE_PRICE_PRO,
@@ -50,7 +52,7 @@ PLAN_TO_PRICE = {
 }
 
 # -------------------------------------------------------------------
-# Email helper (Brevo) – USED BY SUMMARY ONLY
+# Email helper (Brevo)
 # -------------------------------------------------------------------
 
 async def send_email(to_email: str, subject: str, html_content: str):
@@ -88,6 +90,7 @@ class GenerateSummaryRequest(BaseModel):
     recipient_email: EmailStr
     content: str
 
+
 # -------------------------------------------------------------------
 # Health
 # -------------------------------------------------------------------
@@ -97,7 +100,7 @@ async def health():
     return {"status": "ok"}
 
 # -------------------------------------------------------------------
-# Checkout (COUPONS ENABLED – UNCHANGED)
+# Checkout
 # -------------------------------------------------------------------
 
 @app.post("/create-checkout-session")
@@ -113,21 +116,24 @@ async def create_checkout_session(req: CheckoutRequest):
         success_url=f"{SUCCESS_URL}?session_id={{CHECKOUT_SESSION_ID}}",
         cancel_url=CANCEL_URL,
         customer_email=req.email,
-        allow_promotion_codes=True,  # ✅ coupons preserved
+        allow_promotion_codes=True,  # ✅ coupon box stays
     )
+
+    checkout_url = session.url  # Stripe-hosted Checkout URL
 
     logging.info(
-        f"Checkout session {session.id} created for {req.email} ({req.plan})"
+        f"Created checkout session {session.id} for plan {req.plan} and email {req.email}"
     )
 
+    # Return BOTH keys to keep old + new frontends happy
     return {
-    "url": checkout_url,              # <-- what many frontends expect
-    "checkout_url": checkout_url,     # <-- keep backward compatibility
-    "session_id": session.id
-}
+        "checkout_url": checkout_url,
+        "url": checkout_url,
+        "session_id": session.id,
+    }
 
 # -------------------------------------------------------------------
-# Subscription status (USED BY BILLING PAGE)
+# Subscription status
 # -------------------------------------------------------------------
 
 @app.get("/subscription-status")
@@ -146,11 +152,8 @@ async def subscription_status(email: EmailStr):
 
     for sub in subs.data:
         if sub.status in ("active", "trialing"):
-            price_id = sub["items"]["data"][0]["price"]["id"]
-            plan = next(
-                (k for k, v in PLAN_TO_PRICE.items() if v == price_id),
-                "unknown",
-            )
+            price = sub["items"]["data"][0]["price"]["id"]
+            plan = next((k for k, v in PLAN_TO_PRICE.items() if v == price), "unknown")
             return {
                 "active": True,
                 "plan": plan,
@@ -160,7 +163,7 @@ async def subscription_status(email: EmailStr):
     return {"active": False, "plan": None}
 
 # -------------------------------------------------------------------
-# Generate summary (EMAIL SEND – EXISTING FLOW)
+# Generate summary (EXISTING FLOW – untouched)
 # -------------------------------------------------------------------
 
 @app.post("/generate-summary")
@@ -182,3 +185,4 @@ async def generate_summary(req: GenerateSummaryRequest):
     except Exception as e:
         logging.exception("Error generating summary")
         raise HTTPException(status_code=500, detail=str(e))
+
