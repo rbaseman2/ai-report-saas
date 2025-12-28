@@ -120,7 +120,11 @@ async def create_checkout_session(req: CheckoutRequest):
         f"Checkout session {session.id} created for {req.email} ({req.plan})"
     )
 
-    return {"checkout_url": session.url}
+    return {
+    "url": checkout_url,              # <-- what many frontends expect
+    "checkout_url": checkout_url,     # <-- keep backward compatibility
+    "session_id": session.id
+}
 
 # -------------------------------------------------------------------
 # Subscription status (USED BY BILLING PAGE)
