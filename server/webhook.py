@@ -27,7 +27,9 @@ app.add_middleware(
 # Environment variables
 # -------------------------------------------------------------------
 
-STRIPE_SECRET_KEY = os.getenv("STRIPE_SECRET_KEY")
+STRIPE_SECRET_KEY = os.getenv("STRIPE_SECRET_KEY") or os.getenv("STRIPE_API_KEY") or ""
+stripe.api_key = STRIPE_SECRET_KEY
+
 STRIPE_WEBHOOK_SECRET = os.getenv("STRIPE_WEBHOOK_SECRET")
 
 SUCCESS_URL = os.getenv("SUCCESS_URL")
@@ -41,8 +43,6 @@ BREVO_API_KEY = os.getenv("BREVO_API_KEY")
 BREVO_SENDER_EMAIL = os.getenv("BREVO_SENDER_EMAIL", "admin@robaisolutions.com")
 BREVO_SENDER_NAME = os.getenv("BREVO_SENDER_NAME", "RobAI Solutions")
 
-stripe.api_key = STRIPE_SECRET_KEY
-
 PLAN_TO_PRICE = {
     "basic": STRIPE_PRICE_BASIC,
     "pro": STRIPE_PRICE_PRO,
@@ -50,7 +50,7 @@ PLAN_TO_PRICE = {
 }
 
 # -------------------------------------------------------------------
-# Email helper (Brevo)
+# Email helper (Brevo) – USED BY SUMMARY ONLY
 # -------------------------------------------------------------------
 
 async def send_email(to_email: str, subject: str, html_content: str):
@@ -83,15 +83,10 @@ class CheckoutRequest(BaseModel):
     email: EmailStr
 
 
-class TestEmailRequest(BaseModel):
-    email: EmailStr
-
-
 class GenerateSummaryRequest(BaseModel):
     email: EmailStr
     recipient_email: EmailStr
     content: str
-
 
 # -------------------------------------------------------------------
 # Health
@@ -102,7 +97,7 @@ async def health():
     return {"status": "ok"}
 
 # -------------------------------------------------------------------
-# Checkout
+# Checkout (COUPONS ENABLED – UNCHANGED)
 # -------------------------------------------------------------------
 
 @app.post("/create-checkout-session")
@@ -118,17 +113,17 @@ async def create_checkout_session(req: CheckoutRequest):
         success_url=f"{SUCCESS_URL}?session_id={{CHECKOUT_SESSION_ID}}",
         cancel_url=CANCEL_URL,
         customer_email=req.email,
-        allow_promotion_codes=True,  # ✅ coupon box stays
+        allow_promotion_codes=True,  # ✅ coupons preserved
     )
 
     logging.info(
-        f"Created checkout session {session.id} for plan {req.plan} and email {req.email}"
+        f"Checkout session {session.id} created for {req.email} ({req.plan})"
     )
 
     return {"checkout_url": session.url}
 
 # -------------------------------------------------------------------
-# Subscription status
+# Subscription status (USED BY BILLING PAGE)
 # -------------------------------------------------------------------
 
 @app.get("/subscription-status")
@@ -147,8 +142,11 @@ async def subscription_status(email: EmailStr):
 
     for sub in subs.data:
         if sub.status in ("active", "trialing"):
-            price = sub["items"]["data"][0]["price"]["id"]
-            plan = next((k for k, v in PLAN_TO_PRICE.items() if v == price), "unknown")
+            price_id = sub["items"]["data"][0]["price"]["id"]
+            plan = next(
+                (k for k, v in PLAN_TO_PRICE.items() if v == price_id),
+                "unknown",
+            )
             return {
                 "active": True,
                 "plan": plan,
@@ -158,7 +156,7 @@ async def subscription_status(email: EmailStr):
     return {"active": False, "plan": None}
 
 # -------------------------------------------------------------------
-# Generate summary (EXISTING FLOW – untouched)
+# Generate summary (EMAIL SEND – EXISTING FLOW)
 # -------------------------------------------------------------------
 
 @app.post("/generate-summary")
@@ -179,28 +177,4 @@ async def generate_summary(req: GenerateSummaryRequest):
 
     except Exception as e:
         logging.exception("Error generating summary")
-        raise HTTPException(status_code=500, detail=str(e))
-
-# -------------------------------------------------------------------
-# ✅ SAFE TEST EMAIL ENDPOINT (NEW)
-# -------------------------------------------------------------------
-
-@app.post("/test-email")
-async def test_email(req: TestEmailRequest):
-    """
-    Safe test endpoint.
-    Does NOT affect billing, subscriptions, or summaries.
-    """
-    try:
-        await send_email(
-            to_email=req.email,
-            subject="Test Email – RobAI Solutions",
-            html_content="""
-            <h2>Email Test Successful ✅</h2>
-            <p>This confirms Brevo email delivery is working.</p>
-            """,
-        )
-        return {"email": req.email, "sent": True}
-    except Exception as e:
-        logging.exception("Email test failed")
         raise HTTPException(status_code=500, detail=str(e))
