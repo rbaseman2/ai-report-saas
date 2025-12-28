@@ -7,6 +7,11 @@ import requests
 from fastapi import FastAPI, Request, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, EmailStr
+from fastapi.exceptions import RequestValidationError
+from fastapi.responses import JSONResponse
+from starlette.status import HTTP_422_UNPROCESSABLE_ENTITY
+import base64
+
 
 # -------------------------------------------------------------------
 # App setup
@@ -22,6 +27,27 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+def _safe_json(obj):
+    """Make FastAPI validation errors JSON-safe (bytes -> utf8 or base64)."""
+    if isinstance(obj, bytes):
+        try:
+            return obj.decode("utf-8")
+        except UnicodeDecodeError:
+            return {"__bytes_base64__": base64.b64encode(obj).decode("ascii")}
+    if isinstance(obj, dict):
+        return {k: _safe_json(v) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [_safe_json(v) for v in obj]
+    return obj
+
+
+@app.exception_handler(RequestValidationError)
+async def request_validation_exception_handler(request, exc: RequestValidationError):
+    # Return a clean 422 instead of crashing with UnicodeDecodeError
+    return JSONResponse(
+        status_code=HTTP_422_UNPROCESSABLE_ENTITY,
+        content={"detail": _safe_json(exc.errors())},
+    )
 
 # -------------------------------------------------------------------
 # Environment variables
