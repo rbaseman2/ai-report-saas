@@ -1,179 +1,110 @@
+"""
+streamlit/2_Billing.py
+
+Billing page:
+- Save billing email
+- Check current plan/status (from backend /subscription-status)
+- Choose plan -> backend /create-checkout-session -> redirect to Stripe Checkout
+"""
+from __future__ import annotations
+
 import os
-import streamlit as st
 import requests
+import streamlit as st
 
 st.set_page_config(page_title="Billing & Subscription", layout="wide")
 
-BACKEND_URL = os.getenv("BACKEND_URL", "").rstrip("/")
+BACKEND_URL = os.getenv("BACKEND_URL") or os.getenv("BACKEND_API_URL") or ""
 if not BACKEND_URL:
     st.error("BACKEND_URL environment variable is not set.")
     st.stop()
 
-
-# -----------------------------
-# Helpers
-# -----------------------------
-def get_subscription_status(email: str):
-    r = requests.get(
-        f"{BACKEND_URL}/subscription-status",
-        params={"email": email},
-        timeout=20
-    )
-    r.raise_for_status()
-    return r.json()
-
-
-def create_checkout_session(email: str, plan: str):
-    r = requests.post(
-        f"{BACKEND_URL}/create-checkout-session",
-        json={"email": email, "plan": plan},
-        timeout=30
-    )
-    r.raise_for_status()
-    return r.json()  # expects {"url": "https://checkout.stripe.com/..."}
-
-
-def normalize_plan(plan: str | None):
-    if not plan:
-        return None
-    p = str(plan).strip().lower()
-    if p in ("basic", "pro", "enterprise"):
-        return p
-    return None
-
-
-# -----------------------------
-# Sidebar
-# -----------------------------
-with st.sidebar:
-    st.markdown("## Navigation")
-    try:
-        st.page_link("Home.py", label="Home")
-    except Exception:
-        st.write("Home")
-
-    st.page_link("pages/1_Upload_Data.py", label="Upload Data")
-    st.page_link("pages/2_Billing.py", label="Billing", disabled=True)
-
-    # If you have these pages, keep them; otherwise remove.
-    # st.page_link("pages/3_Terms.py", label="Terms")
-    # st.page_link("pages/4_Privacy.py", label="Privacy")
-
-
-# -----------------------------
-# Header + return status from checkout
-# -----------------------------
 st.title("Billing & Subscription")
 
-# Handle Stripe redirect back (optional)
-# Example return URL: /Billing?status=success&session_id=cs_...
-qp = st.query_params
-checkout_status = qp.get("status", None)
-if checkout_status == "success":
-    st.success("Payment successful! Your subscription is now active.")
-elif checkout_status == "cancel":
-    st.warning("Checkout cancelled. No changes were made.")
-
-
-# -----------------------------
-# Step 1 - Email + status
-# -----------------------------
-st.subheader("Step 1 — Enter your email")
-
-email_default = st.session_state.get("billing_email", "")
-billing_email = st.text_input(
+# -------------------------
+# Step 1 — Email
+# -------------------------
+email = st.text_input(
     "Billing email (used to associate your subscription)",
-    value=email_default,
-    placeholder="you@example.com"
+    value=st.session_state.get("billing_email", ""),
 )
 
-col_a, col_b = st.columns([1, 3], vertical_alignment="center")
-with col_a:
-    check_btn = st.button("Save email & check current plan", use_container_width=True)
-
-status_box = st.empty()
-
-resolved_plan = None
-resolved_status = "none"
-
-if check_btn:
-    email = billing_email.strip()
-    st.session_state["billing_email"] = email
+if st.button("Save email & check current plan"):
     if not email:
-        status_box.error("Please enter a billing email.")
+        st.warning("Please enter an email address.")
     else:
+        st.session_state["billing_email"] = email
         try:
-            sub = get_subscription_status(email)
-            resolved_plan = normalize_plan(sub.get("plan")) or "basic"
-            resolved_status = (sub.get("status") or "none").strip().lower()
+            r = requests.get(f"{BACKEND_URL}/subscription-status", params={"email": email}, timeout=30)
+            r.raise_for_status()
+            data = r.json()
 
-            status_box.info(
-                f"Status: **{resolved_status}**  |  Current plan: **{resolved_plan.title()}**"
-            )
+            # Backend returns BOTH:
+            # - plan/status (what this page expects)
+            # - current_plan/subscription_status (extra)
+            plan = data.get("plan") or data.get("current_plan") or "none"
+            status = data.get("status") or data.get("subscription_status") or "none"
+
+            st.session_state["current_plan"] = plan
+            st.session_state["subscription_status"] = status
+
+            st.success(f"Status: {status} | Current plan: {plan}")
+        except requests.HTTPError as e:
+            st.error(f"Could not check subscription. Backend error {e.response.status_code}: {e.response.text}")
         except Exception as e:
-            status_box.error(f"Could not check subscription. {e}")
+            st.error(f"Could not check subscription: {e}")
 
-# If user already saved email earlier, show status automatically (nice UX)
-if not check_btn and st.session_state.get("billing_email"):
-    try:
-        sub = get_subscription_status(st.session_state["billing_email"])
-        resolved_plan = normalize_plan(sub.get("plan")) or "basic"
-        resolved_status = (sub.get("status") or "none").strip().lower()
-
-        status_box.info(
-            f"Status: **{resolved_status}**  |  Current plan: **{resolved_plan.title()}**"
-        )
-    except Exception:
-        pass
+status = st.session_state.get("subscription_status", "none")
+plan = st.session_state.get("current_plan", "none")
+st.info(f"Status: {status} | Current plan: {plan}")
 
 st.divider()
 
-
-# -----------------------------
-# Step 2 - Plan cards
-# -----------------------------
+# -------------------------
+# Step 2 — Plans
+# -------------------------
 st.subheader("Step 2 — Compare plans & upgrade")
 st.caption("Pick the plan that best fits your workload. You can upgrade later as your needs grow.")
 
-if not st.session_state.get("billing_email"):
-    st.warning("Enter and save your billing email above before selecting a plan.")
+def start_checkout(selected_plan: str):
+    if not st.session_state.get("billing_email"):
+        st.warning("Enter and save your billing email above before selecting a plan.")
+        return
+
+    payload = {"email": st.session_state["billing_email"], "plan": selected_plan}
+    try:
+        r = requests.post(f"{BACKEND_URL}/create-checkout-session", json=payload, timeout=30)
+        r.raise_for_status()
+        j = r.json()
+        checkout_url = j.get("checkout_url") or j.get("url")
+        if not checkout_url:
+            st.error("Checkout URL was not returned by backend.")
+            return
+
+        # Redirect
+        st.markdown(f"[Click here if you are not redirected automatically]({checkout_url})")
+        st.write(
+            f"""
+            <script>
+            window.location.href = "{checkout_url}";
+            </script>
+            """,
+            unsafe_allow_html=True,
+        )
+    except requests.HTTPError as e:
+        st.error(f"Could not start checkout. Backend error {e.response.status_code}: {e.response.text}")
+    except Exception as e:
+        st.error(f"Could not start checkout: {e}")
 
 c1, c2, c3 = st.columns(3)
 
-def plan_card(col, title, price, bullets, plan_key):
+def plan_card(col, title: str, price: str, bullets: list[str], plan_key: str):
     with col:
         st.markdown(f"### {title}")
         st.markdown(f"**{price} / month**")
         for b in bullets:
-            st.markdown(f"- {b}")
-
-        btn = st.button(f"Choose {title}", key=f"choose_{plan_key}", use_container_width=True)
-        if btn:
-            email = (st.session_state.get("billing_email") or "").strip()
-            if not email:
-                st.error("Please enter a billing email in Step 1 first.")
-                st.stop()
-
-            try:
-                data = create_checkout_session(email=email, plan=plan_key)
-                url = data.get("url")
-                if not url:
-                    st.error("Checkout URL was not returned by backend.")
-                    st.stop()
-
-                # Redirect (clean + reliable)
-                st.markdown(
-                    f"""
-                    <meta http-equiv="refresh" content="0; url={url}">
-                    <p>Redirecting to checkout… If you are not redirected, <a href="{url}">click here</a>.</p>
-                    """,
-                    unsafe_allow_html=True
-                )
-                st.stop()
-
-            except Exception as e:
-                st.error(f"Could not start checkout: {e}")
-
+            st.write(f"• {b}")
+        st.button(f"Choose {title}", on_click=start_checkout, args=(plan_key,), use_container_width=True)
 
 plan_card(
     c1,
@@ -184,7 +115,7 @@ plan_card(
         "Up to 400k characters / month",
         "Executive summaries + key insights",
     ],
-    "basic"
+    "basic",
 )
 
 plan_card(
@@ -196,7 +127,7 @@ plan_card(
         "Up to 1.5M characters / month",
         "Action items, risks, and opportunity insights",
     ],
-    "pro"
+    "pro",
 )
 
 plan_card(
@@ -208,9 +139,7 @@ plan_card(
         "Up to 5M characters / month",
         "Team accounts, shared templates, & premium support",
     ],
-    "enterprise"
+    "enterprise",
 )
 
-st.info(
-    "Coupons/promo codes are entered on the Stripe Checkout page (they will appear if enabled in your Stripe settings)."
-)
+st.caption("Coupons/promo codes are entered on the Stripe Checkout page (they will appear if enabled in your Stripe settings).")
