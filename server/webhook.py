@@ -1,499 +1,483 @@
 """
 server/webhook.py
-FastAPI backend for AI Report SaaS
 
-Goals:
-- Keep the existing working contract for the Streamlit frontend.
-- Be tolerant of environment variable naming differences (Render vs local).
-- Provide BOTH legacy + newer response keys to avoid breaking UI pages.
-
-Endpoints used by frontend:
-- GET  /health
-- GET  /subscription-status?email=...
-- POST /create-checkout-session   {email, plan}
-- POST /upload                   multipart/form-data (file + account_email)
-- POST /generate-summary          (JSON or multipart) -> returns summary, and can email it
-- POST /webhook                   Stripe webhook endpoint
+Single-file FastAPI backend for:
+- Stripe checkout session creation (with coupon/promo code box enabled)
+- Stripe webhook processing (subscription activation/cancellation)
+- Subscription status lookup by billing email
+- Generate summary endpoint that accepts multipart/form-data (file + fields)
+  NOTE: This fixes the UnicodeDecodeError caused by trying to parse multipart as JSON.
 """
 from __future__ import annotations
 
-import base64
-import hashlib
-import io
-import json
-import logging
 import os
+import json
 import time
-import uuid
-from dataclasses import dataclass
-from datetime import datetime, timezone
-from pathlib import Path
-from typing import Any, Dict, Optional, Tuple
+from typing import Optional, Dict, Any, Tuple
 
-import stripe
-from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
+from fastapi import FastAPI, Request, HTTPException, UploadFile, File, Form, Query
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, EmailStr
+from fastapi.responses import JSONResponse
+import stripe
+import requests
 
-logger = logging.getLogger("ai_report_backend")
-logging.basicConfig(level=logging.INFO)
+# Optional dependencies for document parsing
+try:
+    from pypdf import PdfReader  # type: ignore
+except Exception:
+    PdfReader = None  # type: ignore
 
+try:
+    import docx  # python-docx
+except Exception:
+    docx = None  # type: ignore
+
+
+# -----------------------------
+# Config
+# -----------------------------
+def _env(*names: str, default: Optional[str] = None) -> Optional[str]:
+    for n in names:
+        v = os.getenv(n)
+        if v is not None and str(v).strip() != "":
+            return v
+    return default
+
+
+STRIPE_SECRET_KEY = _env("STRIPE_SECRET_KEY", "STRIPE_API_KEY", "STRIPE_KEY")
+STRIPE_WEBHOOK_SECRET = _env("STRIPE_WEBHOOK_SECRET", "STRIPE_ENDPOINT_SECRET")
+
+PRICE_BASIC = _env("STRIPE_PRICE_BASIC")
+PRICE_PRO = _env("STRIPE_PRICE_PRO")
+PRICE_ENTERPRISE = _env("STRIPE_PRICE_ENTERPRISE")
+
+FRONTEND_URL = _env("FRONTEND_URL", default="http://localhost:8501")
+CANCEL_URL = _env("CANCEL_URL", default=FRONTEND_URL)
+
+OPENAI_API_KEY = _env("OPENAI_API_KEY")
+BREVO_API_KEY = _env("BREVO_API_KEY")
+EMAIL_FROM = _env("EMAIL_FROM")  # must be a verified sender in Brevo
+
+if not STRIPE_SECRET_KEY:
+    # We don't crash hard at import time; some endpoints can still respond with helpful errors.
+    stripe.api_key = ""
+else:
+    stripe.api_key = STRIPE_SECRET_KEY
+
+
+PLAN_BY_PRICE: Dict[str, str] = {}
+if PRICE_BASIC:
+    PLAN_BY_PRICE[PRICE_BASIC] = "basic"
+if PRICE_PRO:
+    PLAN_BY_PRICE[PRICE_PRO] = "pro"
+if PRICE_ENTERPRISE:
+    PLAN_BY_PRICE[PRICE_ENTERPRISE] = "enterprise"
+
+CHAR_LIMITS = {
+    "basic": 400_000,        # aligns with your UI copy
+    "pro": 1_500_000,
+    "enterprise": 5_000_000,
+}
+
+
+# -----------------------------
+# App + CORS
+# -----------------------------
 app = FastAPI()
 
-# -----------------------------
-# CORS
-# -----------------------------
-FRONTEND_URL = os.getenv("FRONTEND_URL", "*")
-allowed_origins = ["*"] if FRONTEND_URL in ("*", "", None) else [FRONTEND_URL]
+# Allow your Streamlit frontend to call the API.
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=allowed_origins,
+    allow_origins=[FRONTEND_URL, "https://ai-report-saas.onrender.com", "https://ai-report-saas.onrender.com/"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# -----------------------------
-# Environment / Stripe config
-# -----------------------------
-# Render UI shows STRIPE_API_KEY; many tutorials use STRIPE_SECRET_KEY.
-STRIPE_SECRET_KEY = os.getenv("STRIPE_SECRET_KEY") or os.getenv("STRIPE_API_KEY") or ""
-STRIPE_WEBHOOK_SECRET = os.getenv("STRIPE_WEBHOOK_SECRET") or ""
-
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY") or ""
-BREVO_API_KEY = os.getenv("BREVO_API_KEY") or os.getenv("SENDINBLUE_API_KEY") or ""
-EMAIL_FROM = os.getenv("EMAIL_FROM") or os.getenv("SENDER_EMAIL") or ""
-
-# Stripe prices (must be set in Render for live)
-STRIPE_PRICE_BASIC = os.getenv("STRIPE_PRICE_BASIC") or ""
-STRIPE_PRICE_PRO = os.getenv("STRIPE_PRICE_PRO") or ""
-STRIPE_PRICE_ENTERPRISE = os.getenv("STRIPE_PRICE_ENTERPRISE") or ""
-
-PLAN_ALIASES = {
-    "basic": "basic",
-    "starter": "basic",
-    "free": "basic",
-    "pro": "pro",
-    "professional": "pro",
-    "plus": "pro",
-    "enterprise": "enterprise",
-    "ent": "enterprise",
-    "business": "enterprise",
-}
-
-PLAN_TO_PRICE = {
-    "basic": STRIPE_PRICE_BASIC,
-    "pro": STRIPE_PRICE_PRO,
-    "enterprise": STRIPE_PRICE_ENTERPRISE,
-}
-
-if STRIPE_SECRET_KEY:
-    stripe.api_key = STRIPE_SECRET_KEY
-
-
-def normalize_plan(plan: str) -> str:
-    p = (plan or "").strip().lower()
-    p = PLAN_ALIASES.get(p, p)
-    return p
-
-
-def require_env(value: str, name: str) -> None:
-    if not value:
-        raise HTTPException(status_code=500, detail=f"{name} is not set in environment variables.")
-
-
-# -----------------------------
-# In-memory upload store
-# (Good enough for now; later you can move this to DB or S3)
-# -----------------------------
-UPLOAD_DIR = Path(os.getenv("UPLOAD_DIR") or "/tmp/uploads")
-UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
-
-# upload_id -> dict(path, filename, content_type, created_at, sha256)
-UPLOAD_INDEX: Dict[str, Dict[str, Any]] = {}
-
-
-# -----------------------------
-# Models
-# -----------------------------
-class CheckoutRequest(BaseModel):
-    email: EmailStr
-    plan: str
-
-
-class UploadResponse(BaseModel):
-    upload_id: str
-    filename: str
-    content_type: str
-    bytes: int
-
-
-class GenerateSummaryJSONRequest(BaseModel):
-    # Either provide 'content' (text) OR 'upload_id' (previously uploaded file).
-    content: Optional[str] = None
-    upload_id: Optional[str] = None
-    recipient_email: Optional[EmailStr] = None
-    email_summary: bool = True
-
 
 # -----------------------------
 # Helpers
 # -----------------------------
-def _sha256(data: bytes) -> str:
-    return hashlib.sha256(data).hexdigest()
+def _require_stripe_config() -> None:
+    if not STRIPE_SECRET_KEY:
+        raise HTTPException(status_code=500, detail="Stripe is not configured (missing STRIPE_SECRET_KEY).")
+    if not (PRICE_BASIC and PRICE_PRO and PRICE_ENTERPRISE):
+        raise HTTPException(
+            status_code=500,
+            detail="Stripe price IDs are not configured (missing STRIPE_PRICE_BASIC/PRO/ENTERPRISE).",
+        )
 
 
-def _read_upload(upload_id: str) -> Tuple[bytes, Dict[str, Any]]:
-    meta = UPLOAD_INDEX.get(upload_id)
-    if not meta:
-        raise HTTPException(status_code=404, detail="upload_id not found (please re-upload).")
-    path = Path(meta["path"])
-    if not path.exists():
-        raise HTTPException(status_code=404, detail="Uploaded file missing on server (please re-upload).")
-    return path.read_bytes(), meta
+def _safe_email(s: Optional[str]) -> Optional[str]:
+    if not s:
+        return None
+    s = s.strip()
+    return s if "@" in s and "." in s else None
 
 
-def _extract_text_from_pdf(pdf_bytes: bytes) -> str:
+def _extract_text_from_upload(upload: UploadFile) -> str:
     """
-    Best-effort PDF text extraction.
+    Extract plain text from supported file types.
+    Keeps it simple and safe; if parsing libs are missing, we fail with a clear message.
     """
-    try:
-        # pypdf is lightweight and commonly available
-        from pypdf import PdfReader  # type: ignore
-        reader = PdfReader(io.BytesIO(pdf_bytes))
-        parts = []
-        for page in reader.pages:
-            parts.append(page.extract_text() or "")
-        return "\n".join(parts).strip()
-    except Exception:
-        # fallback to PyPDF2 if installed
+    filename = (upload.filename or "").lower()
+    content = upload.file.read()  # bytes
+    upload.file.close()
+
+    # TXT / MD / CSV
+    if filename.endswith((".txt", ".md", ".csv")):
+        # Replace invalid bytes rather than failing.
+        return content.decode("utf-8", errors="replace")
+
+    # PDF
+    if filename.endswith(".pdf"):
+        # Try multiple extractors so production doesn't depend on a single optional package.
+        # 1) pypdf (preferred for simple text PDFs)
+        if PdfReader is not None:
+            try:
+                import io
+                reader = PdfReader(io.BytesIO(content))
+                chunks = []
+                for p in reader.pages:
+                    try:
+                        chunks.append(p.extract_text() or "")
+                    except Exception:
+                        chunks.append("")
+                text = "\n".join(chunks).strip()
+                if text:
+                    return text
+            except Exception:
+                # fall through to other extractors
+                pass
+
+        # 2) pdfminer.six (good fallback, pure python)
         try:
-            import PyPDF2  # type: ignore
-            reader = PyPDF2.PdfReader(io.BytesIO(pdf_bytes))
-            parts = []
-            for page in reader.pages:
-                parts.append(page.extract_text() or "")
-            return "\n".join(parts).strip()
+            import io
+            from pdfminer.high_level import extract_text as _pdfminer_extract_text  # type: ignore
+            text = _pdfminer_extract_text(io.BytesIO(content)) or ""
+            text = text.strip()
+            if text:
+                return text
         except Exception:
-            return ""
+            pass
+
+        # 3) PyMuPDF / fitz (often works well on tricky PDFs)
+        try:
+            import fitz  # type: ignore
+            doc = fitz.open(stream=content, filetype="pdf")
+            chunks = []
+            for page in doc:
+                try:
+                    chunks.append(page.get_text() or "")
+                except Exception:
+                    chunks.append("")
+            text = "\n".join(chunks).strip()
+            if text:
+                return text
+        except Exception:
+            pass
+
+        raise HTTPException(
+            status_code=500,
+            detail="PDF text extraction not available. Add 'pypdf' (recommended) or 'pdfminer.six' or 'pymupdf' to requirements.txt."
+        )
+
+# DOCX
+    if filename.endswith(".docx"):
+        if docx is None:
+            raise HTTPException(status_code=500, detail="DOCX support not installed (missing python-docx).")
+        try:
+            import io
+            f = io.BytesIO(content)
+            d = docx.Document(f)
+            return "\n".join(p.text for p in d.paragraphs).strip()
+        except HTTPException:
+            raise
+        except Exception as e:
+            raise HTTPException(status_code=400, detail=f"Could not read DOCX: {e}")
+
+    raise HTTPException(status_code=400, detail="Unsupported file type. Use TXT, MD, PDF, DOCX, or CSV.")
 
 
-def _simple_summary(text: str, max_chars: int = 6000) -> str:
+def _stripe_find_customer_id_by_email(email: str) -> Optional[str]:
+    _require_stripe_config()
+    res = stripe.Customer.list(email=email, limit=1)
+    if res and res.data:
+        return res.data[0].id
+    return None
+
+
+def _stripe_get_plan_for_email(email: str) -> Tuple[str, Optional[str]]:
     """
-    Minimal, deterministic summary (keeps app working even if OpenAI key isn't configured yet).
-    If OPENAI_API_KEY is set, you can later swap this to a real LLM call.
+    Returns (status, plan) where:
+      status: 'active' | 'trialing' | 'past_due' | 'canceled' | 'none'
+      plan:   'basic' | 'pro' | 'enterprise' | None
     """
-    t = (text or "").strip()
-    if not t:
-        return "No text content was provided."
-    t = t[:max_chars]
-    # simple heuristic: return first chunk with a header
-    return f"Summary (preview):\n\n{t[:1500]}"
+    _require_stripe_config()
 
+    customer_id = _stripe_find_customer_id_by_email(email)
+    if not customer_id:
+        return ("none", None)
 
-def _send_email_brevo(to_email: str, subject: str, html: str) -> bool:
-    """
-    Sends email via Brevo if configured. Returns True if sent, False otherwise.
-    """
-    if not (BREVO_API_KEY and EMAIL_FROM):
-        logger.warning("Email not sent: BREVO_API_KEY and/or EMAIL_FROM not configured.")
-        return False
+    subs = stripe.Subscription.list(
+        customer=customer_id,
+        status="all",
+        limit=10,
+        expand=["data.items.data.price"],
+    )
+    if not subs or not subs.data:
+        return ("none", None)
 
+    # Prefer an active or trialing sub; otherwise pick the newest.
+    preferred = None
+    for s in subs.data:
+        if s.status in ("active", "trialing"):
+            preferred = s
+            break
+    if preferred is None:
+        preferred = sorted(subs.data, key=lambda x: getattr(x, "created", 0), reverse=True)[0]
+
+    plan = None
     try:
-        import requests  # type: ignore
-        url = "https://api.brevo.com/v3/smtp/email"
-        headers = {"api-key": BREVO_API_KEY, "Content-Type": "application/json", "accept": "application/json"}
-        payload = {
-            "sender": {"email": EMAIL_FROM, "name": "AI Report"},
-            "to": [{"email": to_email}],
-            "subject": subject,
-            "htmlContent": html,
-        }
-        r = requests.post(url, headers=headers, data=json.dumps(payload), timeout=20)
-        if r.status_code >= 200 and r.status_code < 300:
-            return True
-        logger.error("Brevo send failed: %s %s", r.status_code, r.text)
-        return False
+        price_id = preferred["items"]["data"][0]["price"]["id"]
+        plan = PLAN_BY_PRICE.get(price_id)
     except Exception:
-        logger.exception("Brevo send failed with exception")
-        return False
+        plan = None
+
+    return (preferred.status or "none", plan)
+
+
+def _openai_summarize(text: str, plan: str) -> str:
+    if not OPENAI_API_KEY:
+        raise HTTPException(status_code=500, detail="OpenAI is not configured (missing OPENAI_API_KEY).")
+
+    # Keep request minimal; uses OpenAI responses via HTTPS (no SDK dependency required).
+    # If you use a different model name, update here.
+    model = _env("OPENAI_MODEL", default="gpt-4o-mini")
+
+    if plan == "enterprise":
+        instructions = (
+            "Create an enterprise-grade document summary with:\n"
+            "- Executive summary\n"
+            "- Key findings (bullets)\n"
+            "- Risks / red flags\n"
+            "- Recommended next steps\n"
+            "- Plain-language explanation for a non-expert\n"
+            "Be accurate and avoid leaking personal identifiers unless relevant."
+        )
+    elif plan == "pro":
+        instructions = (
+            "Create a professional summary with:\n"
+            "- Summary\n"
+            "- Key points\n"
+            "- Action items\n"
+            "Be concise but thorough."
+        )
+    else:
+        instructions = (
+            "Create a brief, clear summary with:\n"
+            "- Summary\n"
+            "- 3–5 key takeaways\n"
+        )
+
+    payload = {
+        "model": model,
+        "messages": [
+            {"role": "system", "content": instructions},
+            {"role": "user", "content": text[:2000000]},  # guard huge payloads
+        ],
+        "temperature": 0.2,
+    }
+
+    r = requests.post(
+        "https://api.openai.com/v1/chat/completions",
+        headers={"Authorization": f"Bearer {OPENAI_API_KEY}", "Content-Type": "application/json"},
+        data=json.dumps(payload),
+        timeout=90,
+    )
+    if r.status_code >= 300:
+        raise HTTPException(status_code=500, detail=f"OpenAI error: {r.status_code} {r.text[:500]}")
+    data = r.json()
+    try:
+        return data["choices"][0]["message"]["content"].strip()
+    except Exception:
+        raise HTTPException(status_code=500, detail="OpenAI response parsing failed.")
+
+
+def _brevo_send_email(to_email: str, subject: str, html: str) -> None:
+    if not BREVO_API_KEY:
+        raise HTTPException(status_code=500, detail="Email is not configured (missing BREVO_API_KEY).")
+    if not EMAIL_FROM:
+        raise HTTPException(status_code=500, detail="Email sender is not configured (missing EMAIL_FROM).")
+
+    url = "https://api.brevo.com/v3/smtp/email"
+    headers = {
+        "api-key": BREVO_API_KEY,
+        "Content-Type": "application/json",
+        "accept": "application/json",
+    }
+    payload = {
+        "sender": {"email": EMAIL_FROM},
+        "to": [{"email": to_email}],
+        "subject": subject,
+        "htmlContent": html,
+    }
+    resp = requests.post(url, headers=headers, data=json.dumps(payload), timeout=30)
+    if resp.status_code >= 300:
+        raise HTTPException(status_code=500, detail=f"Brevo email failed: {resp.status_code} {resp.text[:500]}")
 
 
 # -----------------------------
 # Routes
 # -----------------------------
 @app.get("/health")
-def health() -> Dict[str, str]:
-    return {"status": "ok"}
+def health() -> Dict[str, Any]:
+    return {
+        "ok": True,
+        "stripe_configured": bool(STRIPE_SECRET_KEY),
+        "prices_configured": bool(PRICE_BASIC and PRICE_PRO and PRICE_ENTERPRISE),
+        "openai_configured": bool(OPENAI_API_KEY),
+        "email_configured": bool(BREVO_API_KEY and EMAIL_FROM),
+        "ts": int(time.time()),
+    }
 
 
 @app.get("/subscription-status")
-def subscription_status(email: str) -> Dict[str, Any]:
-    """
-    Return keys expected by Billing page:
-      - plan (basic/pro/enterprise or None)
-      - status (active/trialing/canceled/none)
-    Also returns richer keys for future use (backward compatible).
-    """
-    # If Stripe isn't configured, don't 500 the UI.
-    if not STRIPE_SECRET_KEY:
-        return {
-            "email": email,
-            "plan": None,
-            "status": "none",
-            "has_customer": False,
-            "has_active_subscription": False,
-            "current_plan": None,
-            "subscription_status": "none",
-            "current_period_end": None,
-            "updated_at_utc": datetime.now(timezone.utc).isoformat(),
-            "note": "Stripe not configured (missing STRIPE_SECRET_KEY/STRIPE_API_KEY).",
-        }
-
-    try:
-        customers = stripe.Customer.list(email=email, limit=1)
-        if not customers.data:
-            return {
-                "email": email,
-                "plan": None,
-                "status": "none",
-                "has_customer": False,
-                "has_active_subscription": False,
-                "current_plan": None,
-                "subscription_status": "none",
-                "current_period_end": None,
-                "updated_at_utc": datetime.now(timezone.utc).isoformat(),
-            }
-
-        customer = customers.data[0]
-        subs = stripe.Subscription.list(
-            customer=customer.id,
-            status="all",
-            limit=10,
-            expand=["data.items.data.price"],
-        )
-
-        chosen = None
-        if subs.data:
-            # prefer active/trialing, else most recent
-            active = [s for s in subs.data if s.status in ("active", "trialing")]
-            chosen = active[0] if active else subs.data[0]
-
-        if not chosen:
-            return {
-                "email": email,
-                "plan": None,
-                "status": "none",
-                "has_customer": True,
-                "has_active_subscription": False,
-                "current_plan": None,
-                "subscription_status": "none",
-                "current_period_end": None,
-                "updated_at_utc": datetime.now(timezone.utc).isoformat(),
-            }
-
-        price_id = None
-        try:
-            price_id = chosen["items"]["data"][0]["price"]["id"]
-        except Exception:
-            price_id = None
-
-        current_plan = None
-        if price_id:
-            for plan_name, env_price in PLAN_TO_PRICE.items():
-                if env_price and env_price == price_id:
-                    current_plan = plan_name
-                    break
-
-        has_active = chosen.status in ("active", "trialing")
-
-        return {
-            # keys Billing.py expects
-            "email": email,
-            "plan": current_plan if has_active else None,
-            "status": chosen.status if chosen.status else "none",
-            # extra keys (keep compatibility)
-            "has_customer": True,
-            "has_active_subscription": has_active,
-            "current_plan": current_plan,
-            "subscription_status": chosen.status,
-            "current_period_end": int(getattr(chosen, "current_period_end", 0) or 0) or None,
-            "updated_at_utc": datetime.now(timezone.utc).isoformat(),
-        }
-    except stripe.error.StripeError as e:
-        logger.exception("Stripe error in subscription-status")
-        raise HTTPException(status_code=500, detail=str(e.user_message or str(e)))
+def subscription_status(email: str = Query(...)) -> Dict[str, Any]:
+    email = (email or "").strip()
+    if not email:
+        raise HTTPException(status_code=400, detail="Email is required.")
+    status, plan = _stripe_get_plan_for_email(email)
+    return {"email": email, "status": status, "plan": plan}
 
 
 @app.post("/create-checkout-session")
-def create_checkout_session(req: CheckoutRequest) -> Dict[str, Any]:
-    require_env(STRIPE_SECRET_KEY, "STRIPE_SECRET_KEY (or STRIPE_API_KEY)")
-    plan = normalize_plan(req.plan)
-
-    if plan not in PLAN_TO_PRICE:
-        raise HTTPException(status_code=400, detail="Invalid plan")
-
-    price_id = PLAN_TO_PRICE.get(plan, "")
-    if not price_id:
-        raise HTTPException(status_code=500, detail=f"Stripe price id for plan '{plan}' is not set (missing STRIPE_PRICE_{plan.upper()}).")
-
-    # Default return URLs (frontend can just redirect to Stripe; success will land on frontend)
-    success_url = os.getenv("SUCCESS_URL") or f"{FRONTEND_URL}/Upload_Data"
-    cancel_url = os.getenv("CANCEL_URL") or f"{FRONTEND_URL}/Billing"
+async def create_checkout_session(request: Request) -> Dict[str, Any]:
+    """
+    Expects JSON: { "email": "...", "plan": "basic|pro|enterprise" }
+    Returns: { "url": "https://checkout.stripe.com/..." }
+    """
+    _require_stripe_config()
 
     try:
-        session = stripe.checkout.Session.create(
-            mode="subscription",
-            payment_method_types=["card"],
-            line_items=[{"price": price_id, "quantity": 1}],
-            success_url=f"{success_url}?session_id={{CHECKOUT_SESSION_ID}}",
-            cancel_url=cancel_url,
-            customer_email=req.email,
-            allow_promotion_codes=True,
-        )
-        checkout_url = session.url
-        logger.info("Created checkout session %s for %s (%s)", session.id, req.email, plan)
-
-        # Return BOTH keys (some frontends look for checkout_url, others url)
-        return {"checkout_url": checkout_url, "url": checkout_url, "session_id": session.id}
+        body = await request.json()
     except Exception:
-        logger.exception("create-checkout-session failed")
-        raise HTTPException(status_code=500, detail="Checkout session failed. Check server logs.")
+        raise HTTPException(status_code=400, detail="Invalid JSON.")
+
+    email = _safe_email(body.get("email"))
+    plan = (body.get("plan") or "").strip().lower()
+
+    if not email:
+        raise HTTPException(status_code=400, detail="Valid email is required.")
+    if plan not in ("basic", "pro", "enterprise"):
+        raise HTTPException(status_code=400, detail="Plan must be basic, pro, or enterprise.")
+
+    price_id = {
+        "basic": PRICE_BASIC,
+        "pro": PRICE_PRO,
+        "enterprise": PRICE_ENTERPRISE,
+    }.get(plan)
+
+    if not price_id:
+        raise HTTPException(status_code=500, detail="Price ID missing for selected plan.")
+
+    session = stripe.checkout.Session.create(
+        mode="subscription",
+        customer_email=email,
+        line_items=[{"price": price_id, "quantity": 1}],
+        success_url=f"{FRONTEND_URL}/Billing?status=success&session_id={{CHECKOUT_SESSION_ID}}",
+        cancel_url=f"{CANCEL_URL}/Billing?status=cancel",
+        allow_promotion_codes=True,  # <-- coupon/promo code box
+    )
+    return {"url": session.url}
 
 
 @app.post("/webhook")
-async def stripe_webhook(request: Request) -> Dict[str, Any]:
+async def stripe_webhook(request: Request):
     """
-    Stripe webhook endpoint. Configure Stripe to post to:
-      https://<your-backend>/webhook
+    Stripe sends raw bytes; verify signature then process.
     """
     payload = await request.body()
-    sig_header = request.headers.get("stripe-signature")
-
+    sig = request.headers.get("stripe-signature")
     if not STRIPE_WEBHOOK_SECRET:
-        # Don't break in dev; just acknowledge.
-        logger.warning("STRIPE_WEBHOOK_SECRET not set; skipping signature verification.")
-        return {"received": True, "verified": False}
+        raise HTTPException(status_code=500, detail="Missing STRIPE_WEBHOOK_SECRET.")
 
     try:
-        event = stripe.Webhook.construct_event(payload, sig_header, STRIPE_WEBHOOK_SECRET)
-    except Exception:
-        logger.exception("Stripe webhook signature verification failed")
-        raise HTTPException(status_code=400, detail="Invalid signature")
+        event = stripe.Webhook.construct_event(payload=payload, sig_header=sig, secret=STRIPE_WEBHOOK_SECRET)
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Webhook signature verification failed: {e}")
 
-    # You can extend these handlers later.
-    try:
-        event_type = event["type"]
-        logger.info("Stripe webhook received: %s", event_type)
-    except Exception:
-        event_type = "unknown"
-
-    return {"received": True, "verified": True, "type": event_type}
-
-
-@app.post("/upload", response_model=UploadResponse)
-async def upload(
-    file: UploadFile = File(...),
-    account_email: str = Form(...),
-) -> UploadResponse:
-    """
-    Upload a PDF (or any file). Returns an upload_id.
-    Streamlit can store upload_id in session_state.
-    """
-    data = await file.read()
-    if not data:
-        raise HTTPException(status_code=400, detail="Empty upload")
-
-    upload_id = uuid.uuid4().hex
-    safe_name = (file.filename or "upload.bin").replace("\\", "_").replace("/", "_")
-    path = UPLOAD_DIR / f"{upload_id}__{safe_name}"
-    path.write_bytes(data)
-
-    meta = {
-        "path": str(path),
-        "filename": safe_name,
-        "content_type": file.content_type or "application/octet-stream",
-        "bytes": len(data),
-        "sha256": _sha256(data),
-        "account_email": account_email,
-        "created_at_utc": datetime.now(timezone.utc).isoformat(),
-    }
-    UPLOAD_INDEX[upload_id] = meta
-
-    return UploadResponse(upload_id=upload_id, filename=safe_name, content_type=meta["content_type"], bytes=meta["bytes"])
+    # Minimal processing: you can persist subscription/customer mapping in DB if desired.
+    # For now, we just acknowledge.
+    return {"received": True, "type": event.get("type")}
 
 
 @app.post("/generate-summary")
-async def generate_summary(request: Request) -> Dict[str, Any]:
+async def generate_summary(
+    billing_email: str = Form(...),
+    recipient_email: Optional[str] = Form(None),
+    text: Optional[str] = Form(None),
+    file: Optional[UploadFile] = File(None),
+):
     """
-    Accepts either:
-    - JSON: {content?, upload_id?, recipient_email?, email_summary?}
-    - multipart/form-data:
-        file (optional) OR upload_id
-        recipient_email (optional)
-        email_summary (optional)
-        content (optional)
-    Returns:
-      {summary: "...", emailed: bool, upload_id?: "..."}
+    IMPORTANT:
+    This endpoint is called by Streamlit using requests.post(data=payload, files=files).
+    That is multipart/form-data, not JSON.
+    The previous implementation used `await request.json()` which caused:
+      UnicodeDecodeError: 'utf-8' codec can't decode byte ... (because the body includes binary PDF bytes)
+
+    This implementation accepts proper Form + File params.
     """
-    content_type = request.headers.get("content-type", "")
-    recipient_email: Optional[str] = None
-    email_summary: bool = True
-    content_text: Optional[str] = None
-    upload_id: Optional[str] = None
-    file_bytes: Optional[bytes] = None
-    file_meta: Optional[Dict[str, Any]] = None
+    billing_email = (billing_email or "").strip()
+    if not billing_email:
+        raise HTTPException(status_code=400, detail="billing_email is required.")
 
-    if content_type.startswith("multipart/form-data"):
-        form = await request.form()
-        recipient_email = (form.get("recipient_email") or form.get("email") or None)
-        email_summary = str(form.get("email_summary") or "true").lower() not in ("0", "false", "no")
-        content_text = (form.get("content") or None)
-        upload_id = (form.get("upload_id") or None)
+    recipient_email = _safe_email(recipient_email) if recipient_email else None
 
-        upl = form.get("file")
-        if isinstance(upl, UploadFile):
-            file_bytes = await upl.read()
-            file_meta = {"filename": upl.filename, "content_type": upl.content_type}
-    else:
-        try:
-            payload = await request.json()
-        except Exception:
-            payload = {}
+    extracted = ""
+    if file is not None:
+        extracted = _extract_text_from_upload(file)
+    if text and text.strip():
+        # Manual text overrides/augments extracted content.
+        extracted = (extracted + "\n\n" + text.strip()).strip() if extracted else text.strip()
 
-        # tolerate non-dict payloads
-        if not isinstance(payload, dict):
-            payload = {}
+    if not extracted:
+        raise HTTPException(status_code=400, detail="Provide a file or text to summarize.")
 
-        recipient_email = payload.get("recipient_email")
-        email_summary = bool(payload.get("email_summary", True))
-        content_text = payload.get("content")
-        upload_id = payload.get("upload_id")
+    status, plan = _stripe_get_plan_for_email(billing_email)
+    # If no plan found but subscription exists, treat as lowest tier; you can change this behavior.
+    plan = plan or "basic"
 
-    if file_bytes:
-        # PDF? extract; else treat as text bytes (best effort)
-        extracted = ""
-        if (file_meta or {}).get("content_type", "").lower().endswith("pdf") or (file_meta or {}).get("filename", "").lower().endswith(".pdf"):
-            extracted = _extract_text_from_pdf(file_bytes)
-        if not extracted:
-            try:
-                extracted = file_bytes.decode("utf-8", errors="ignore")
-            except Exception:
-                extracted = ""
-        content_text = (content_text or "") + ("\n\n" + extracted if extracted else "")
+    # Enforce limits
+    limit = CHAR_LIMITS.get(plan, CHAR_LIMITS["basic"])
+    if len(extracted) > limit:
+        raise HTTPException(
+            status_code=413,
+            detail=f"Input too large for {plan} plan ({len(extracted):,} chars). Limit is {limit:,}.",
+        )
 
-    if upload_id and not content_text:
-        raw, meta = _read_upload(upload_id)
-        if str(meta.get("content_type", "")).lower().endswith("pdf") or str(meta.get("filename", "")).lower().endswith(".pdf"):
-            content_text = _extract_text_from_pdf(raw)
-        else:
-            content_text = raw.decode("utf-8", errors="ignore")
+    summary = _openai_summarize(extracted, plan)
 
-    summary = _simple_summary(content_text or "")
+    email_sent = False
+    if recipient_email:
+        # Simple HTML email
+        subject = f"Your {plan.capitalize()} Summary"
+        html = f"""
+        <div style="font-family: Arial, sans-serif; line-height:1.4">
+          <h2>{subject}</h2>
+          <pre style="white-space:pre-wrap; font-family: Arial, sans-serif">{summary}</pre>
+        </div>
+        """
+        _brevo_send_email(recipient_email, subject, html)
+        email_sent = True
 
-    emailed = False
-    if recipient_email and email_summary:
-        html = f"<h2>Your AI Report Summary</h2><pre style='white-space:pre-wrap'>{summary}</pre>"
-        emailed = _send_email_brevo(recipient_email, "Your AI Report Summary", html)
-
-    return {"summary": summary, "emailed": emailed, "upload_id": upload_id}
+    return JSONResponse(
+        {
+            "status": "ok",
+            "subscription_status": status,
+            "plan": plan,
+            "summary": summary,
+            "email_sent": email_sent,
+            "recipient_email": recipient_email,
+        }
+    )
