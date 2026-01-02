@@ -11,6 +11,7 @@ from __future__ import annotations
 import os
 import requests
 import streamlit as st
+import streamlit.components.v1 as components
 
 st.set_page_config(page_title="Billing & Subscription", layout="wide")
 
@@ -83,15 +84,8 @@ def start_checkout(selected_plan: str):
 
         # Redirect
         st.markdown(f"[Click here if you are not redirected automatically]({checkout_url})")
-        st.write(
-            f"""
-            <script>
-            window.location.href = "{checkout_url}";
-            </script>
-            """,
-            unsafe_allow_html=True,
-        )
-    except requests.HTTPError as e:
+        components.html(f"""<script>window.location.href = \"{checkout_url}\";</script>""", height=0)
+except requests.HTTPError as e:
         st.error(f"Could not start checkout. Backend error {e.response.status_code}: {e.response.text}")
     except Exception as e:
         st.error(f"Could not start checkout: {e}")
