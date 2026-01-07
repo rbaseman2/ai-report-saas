@@ -1,170 +1,234 @@
 import os
 import time
-import streamlit as st
+
 import requests
+import streamlit as st
 import streamlit.components.v1 as components
 
 # -----------------------------
 # Config
 # -----------------------------
-st.set_page_config(page_title="Billing & Subscription", layout="wide")
-
-BACKEND_URL = os.getenv("BACKEND_URL", "").rstrip("/")
-if not BACKEND_URL:
-    # sensible default for Render deployment; override with env var
-    BACKEND_URL = "https://ai-report-backend-ubrx.onrender.com"
+BACKEND_URL = os.getenv("BACKEND_URL", "http://127.0.0.1:8000").rstrip("/")
 
 PLANS = {
-    "basic": {"label": "Basic", "price": "$9.99 / month", "bullets": ["Up to 20 reports / month", "Up to 400k characters / month", "Executive summaries + key insights"]},
-    "pro": {"label": "Pro", "price": "$19.99 / month", "bullets": ["Up to 75 reports / month", "Up to 1.5M characters / month", "Action items, risks, and opportunity insights"]},
-    "enterprise": {"label": "Enterprise", "price": "$39.99 / month", "bullets": ["Up to 250 reports / month", "Up to 5M characters / month", "Team accounts, shared templates, & premium support"]},
+    "basic": {
+        "label": "Basic",
+        "price": "$9.99 / month",
+        "bullets": [
+            "Up to 20 reports / month",
+            "Up to 400k characters / month",
+            "Executive summaries + key insights",
+        ],
+    },
+    "pro": {
+        "label": "Pro",
+        "price": "$19.99 / month",
+        "bullets": [
+            "Up to 75 reports / month",
+            "Up to 1.5M characters / month",
+            "Action items, risks, and opportunity insights",
+        ],
+    },
+    "enterprise": {
+        "label": "Enterprise",
+        "price": "$39.99 / month",
+        "bullets": [
+            "Up to 250 reports / month",
+            "Up to 5M characters / month",
+            "Team accounts, shared templates, & premium support",
+        ],
+    },
 }
 
-def _safe_json(resp: requests.Response):
+# -----------------------------
+# Helpers
+# -----------------------------
+
+def _get_query_params() -> dict:
+    """Works across Streamlit versions."""
     try:
-        return resp.json()
+        # Streamlit >= 1.30
+        return dict(st.query_params)
     except Exception:
-        return {"raw": resp.text}
+        return st.experimental_get_query_params()
 
-def get_subscription_status(email: str):
-    r = requests.get(f"{BACKEND_URL}/subscription-status", params={"email": email}, timeout=30)
-    r.raise_for_status()
-    return r.json()
 
-def create_checkout_session(email: str, plan: str):
-    r = requests.post(
-        f"{BACKEND_URL}/create-checkout-session",
-        json={"email": email, "plan": plan},
-        timeout=60,
+def _clear_query_params():
+    try:
+        st.query_params.clear()
+    except Exception:
+        st.experimental_set_query_params()
+
+
+def _backend_get(path: str, params: dict | None = None, timeout: int = 25):
+    url = f"{BACKEND_URL}{path}"
+    return requests.get(url, params=params, timeout=timeout)
+
+
+def _backend_post(path: str, payload: dict, timeout: int = 45):
+    url = f"{BACKEND_URL}{path}"
+    return requests.post(url, json=payload, timeout=timeout)
+
+
+def _render_redirect(checkout_url: str):
+    """Attempt redirect in multiple ways.
+
+    Note: some hosting providers / browsers block programmatic redirects.
+    We always show a fallback button.
+    """
+
+    # 1) meta refresh (sometimes works even when JS is blocked)
+    st.markdown(
+        f"""
+<meta http-equiv="refresh" content="0; url={checkout_url}">
+""",
+        unsafe_allow_html=True,
     )
-    r.raise_for_status()
-    return r.json()
 
-def _js_redirect(url: str):
-    # More reliable than meta refresh across browsers / iframes.
+    # 2) JS redirect (runs inside component iframe; may be blocked by sandbox)
     components.html(
         f"""
-        <script>
-          const u = {url!r};
-          window.top.location.href = u;
-        </script>
-        """,
+<script>
+(function() {{
+  var u = {checkout_url!r};
+  try {{
+    // try top-level navigation first
+    window.top.location.href = u;
+    return;
+  }} catch (e) {{}}
+  try {{
+    window.location.href = u;
+    return;
+  }} catch (e) {{}}
+  try {{
+    var a = document.createElement('a');
+    a.href = u;
+    a.target = '_top';
+    document.body.appendChild(a);
+    a.click();
+  }} catch (e) {{}}
+}})();
+</script>
+""",
         height=0,
-        width=0,
     )
 
-# -----------------------------
-# Handle return from Stripe
-# -----------------------------
-params = st.query_params
-if params.get("status") == "success":
-    st.success("Payment completed successfully.")
-    st.info("Next step: upload a PDF or paste text to generate your summary.")
-    if st.button("Continue to Upload Data", type="primary"):
-        # Navigate to Upload page
-        try:
-            st.switch_page("pages/1_Upload_Data.py")
-        except Exception:
-            st.info("Use the left menu to open **Upload Data**.")
-    st.divider()
+    st.success("Redirecting to Stripe Checkout… If you are not redirected, use the button below.")
+    st.link_button("Open Stripe Checkout", checkout_url, type="primary")
+
 
 # -----------------------------
-# UI
+# Page
 # -----------------------------
+
+st.set_page_config(page_title="Billing & Subscription", layout="wide")
+
 st.title("Billing & Subscription")
 
+# Preserve email across pages
+if "billing_email" not in st.session_state:
+    st.session_state["billing_email"] = ""
+
+qp = _get_query_params()
+status = (qp.get("status", [""])[0] if isinstance(qp.get("status"), list) else qp.get("status", ""))
+
+# ---- Stripe return handling ----
+if status == "success":
+    st.success("✅ Checkout complete. You can now upload a document and generate a summary.")
+    cols = st.columns([1, 3])
+    with cols[0]:
+        if st.button("Continue to Upload Data", type="primary"):
+            try:
+                st.switch_page("pages/1_Upload_Data.py")
+            except Exception:
+                st.info("Use the left sidebar and click **Upload Data**.")
+    with cols[1]:
+        st.info("If the button doesn't work, use the left sidebar → **Upload Data**.")
+    # Clear params so refresh doesn't keep showing success
+    _clear_query_params()
+    st.divider()
+
+elif status == "cancel":
+    st.warning("Checkout was canceled. You can select a plan again anytime.")
+    _clear_query_params()
+    st.divider()
+
+# ---- Step 1: Email + plan status ----
 st.subheader("Step 1 — Enter your email")
-email = st.text_input(
+
+billing_email = st.text_input(
     "Billing email (used to associate your subscription)",
-    value=st.session_state.get("billing_email", ""),
+    value=st.session_state["billing_email"],
     placeholder="you@example.com",
 )
 
-col_a, col_b = st.columns([1, 2])
-with col_a:
-    check = st.button("Check current plan")
-with col_b:
-    status_placeholder = st.empty()
+if billing_email:
+    st.session_state["billing_email"] = billing_email.strip()
 
-if email:
-    st.session_state["billing_email"] = email  # used by Upload page too
+status_box = st.empty()
 
-if check:
-    if not email:
-        st.warning("Please enter a billing email first.")
+if st.button("Check current plan"):
+    if not st.session_state["billing_email"]:
+        st.error("Please enter your billing email first.")
     else:
         try:
-            data = get_subscription_status(email)
-            status = data.get("status", "none")
-            plan = data.get("plan", "none")
-            if status == "active":
-                status_placeholder.success(f"Status: {status} | Current plan: {plan}")
+            r = _backend_get("/subscription-status", params={"email": st.session_state["billing_email"]})
+            if r.status_code == 200:
+                data = r.json()
+                sub_status = data.get("status", "none")
+                plan = data.get("plan", "none")
+                status_box.success(f"Status: {sub_status} | Current plan: {plan}")
             else:
-                status_placeholder.info(f"Status: {status} | Current plan: {plan}")
-        except requests.HTTPError as e:
-            body = _safe_json(e.response) if getattr(e, "response", None) is not None else {"detail": str(e)}
-            status_placeholder.error(f"Could not check subscription. {body}")
+                status_box.error(f"Could not check subscription. {r.text}")
         except Exception as e:
-            status_placeholder.error(f"Could not check subscription. {e}")
+            status_box.error(f"Could not check subscription. {e}")
 
 st.divider()
 
+# ---- Step 2: Choose plan -> create checkout session ----
 st.subheader("Step 2 — Compare plans & upgrade")
-st.caption("Pick the plan that best fits your workload. You can upgrade later as your needs grow.")
-
-c1, c2, c3 = st.columns(3)
-
-def plan_card(container, key: str):
-    p = PLANS[key]
-    with container:
-        st.markdown(f"### {p['label']}")
-        st.markdown(p["price"])
-        for b in p["bullets"]:
-            st.write(f"• {b}")
-        clicked = st.button(f"Choose {p['label']}", key=f"choose_{key}")
-        return clicked
-
-chosen_basic = plan_card(c1, "basic")
-chosen_pro = plan_card(c2, "pro")
-chosen_enterprise = plan_card(c3, "enterprise")
-
-chosen = None
-if chosen_basic: chosen = "basic"
-if chosen_pro: chosen = "pro"
-if chosen_enterprise: chosen = "enterprise"
-
-if chosen:
-    if not email:
-        st.warning("Please enter your billing email above first.")
-    else:
-        st.session_state["selected_plan"] = chosen
-        st.info(f"Selected plan: {chosen}. Creating Stripe Checkout session...")
-        try:
-            out = create_checkout_session(email=email, plan=chosen)
-            checkout_url = out.get("checkout_url") or out.get("url") or out.get("checkoutUrl")
-            if not checkout_url:
-                st.error(f"Backend did not return a checkout URL. Response: {out}")
-            else:
-                st.session_state["checkout_url"] = checkout_url
-                st.session_state.pop("redirect_done", None)
-        except requests.HTTPError as e:
-            body = _safe_json(e.response) if getattr(e, "response", None) is not None else {"detail": str(e)}
-            st.error(f"Could not create checkout session. {body}")
-        except Exception as e:
-            st.error(f"Could not create checkout session. {e}")
-
-# Auto-redirect once per session_state checkout_url
-checkout_url = st.session_state.get("checkout_url")
-if checkout_url:
-    st.success("Redirecting to Stripe Checkout…")
-    st.caption("If you are not redirected automatically, use the button below.")
-    # Try redirect immediately via JS
-    if not st.session_state.get("redirect_done"):
-        st.session_state["redirect_done"] = True
-        _js_redirect(checkout_url)
-        # small delay to give the browser a chance
-        time.sleep(0.2)
-
-    st.link_button("Open Stripe Checkout", checkout_url)
-
 st.caption("Coupons/promo codes are entered on the Stripe Checkout page (if enabled in Stripe).")
+
+cols = st.columns(3)
+plan_keys = ["basic", "pro", "enterprise"]
+
+for idx, plan_key in enumerate(plan_keys):
+    plan = PLANS[plan_key]
+    with cols[idx]:
+        st.markdown(f"### {plan['label']}")
+        st.markdown(plan["price"])
+        for b in plan["bullets"]:
+            st.markdown(f"• {b}")
+
+        if st.button(f"Choose {plan['label']}", key=f"choose_{plan_key}"):
+            if not st.session_state.get("billing_email"):
+                st.error("Enter your billing email above first.")
+                st.stop()
+
+            st.info(f"Selected plan: {plan_key}. Creating Stripe Checkout session…")
+            try:
+                resp = _backend_post(
+                    "/create-checkout-session",
+                    {"email": st.session_state["billing_email"], "plan": plan_key},
+                )
+
+                if resp.status_code != 200:
+                    st.error(f"Checkout session failed: {resp.text}")
+                    st.stop()
+
+                payload = resp.json()
+                checkout_url = payload.get("url") or payload.get("checkout_url")
+
+                if not checkout_url:
+                    st.error(f"Backend did not return a checkout URL. Response: {payload}")
+                    st.stop()
+
+                # Small delay improves reliability on some hosts
+                time.sleep(0.2)
+                _render_redirect(checkout_url)
+
+            except requests.RequestException as e:
+                st.error(f"Network error calling backend: {e}")
+            except Exception as e:
+                st.error(f"Unexpected error: {e}")
+
