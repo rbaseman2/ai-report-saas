@@ -157,25 +157,52 @@ def _extract_text_from_pdf(pdf_bytes: bytes) -> str:
     """
     Best-effort PDF text extraction.
     """
-    try:
-        # pypdf is lightweight and commonly available
-        from pypdf import PdfReader  # type: ignore
-        reader = PdfReader(io.BytesIO(pdf_bytes))
-        parts = []
-        for page in reader.pages:
-            parts.append(page.extract_text() or "")
-        return "\n".join(parts).strip()
-    except Exception:
-        # fallback to PyPDF2 if installed
+    def _try_text_extract() -> str:
+        """Text-based PDFs (selectable text)."""
         try:
-            import PyPDF2  # type: ignore
-            reader = PyPDF2.PdfReader(io.BytesIO(pdf_bytes))
+            # pypdf is lightweight and commonly available
+            from pypdf import PdfReader  # type: ignore
+            reader = PdfReader(io.BytesIO(pdf_bytes))
             parts = []
             for page in reader.pages:
                 parts.append(page.extract_text() or "")
             return "\n".join(parts).strip()
         except Exception:
+            # fallback to PyPDF2 if installed
+            try:
+                import PyPDF2  # type: ignore
+                reader = PyPDF2.PdfReader(io.BytesIO(pdf_bytes))
+                parts = []
+                for page in reader.pages:
+                    parts.append(page.extract_text() or "")
+                return "\n".join(parts).strip()
+            except Exception:
+                return ""
+
+    def _try_ocr_extract() -> str:
+        """Scanned PDFs (image-based). Best-effort OCR if deps exist."""
+        try:
+            # These are optional. On Render you may need to add system packages.
+            # - apt: poppler-utils (for pdf2image)
+            # - apt: tesseract-ocr
+            # - pip: pdf2image pytesseract pillow
+            from pdf2image import convert_from_bytes  # type: ignore
+            import pytesseract  # type: ignore
+
+            images = convert_from_bytes(pdf_bytes, dpi=220)
+            text_parts = []
+            for img in images:
+                text_parts.append(pytesseract.image_to_string(img) or "")
+            return "\n".join(text_parts).strip()
+        except Exception:
             return ""
+
+    text = _try_text_extract()
+    if text:
+        return text
+
+    # OCR fallback for scanned PDFs
+    return _try_ocr_extract()
 
 
 def _simple_summary(text: str, max_chars: int = 6000) -> str:
@@ -489,7 +516,16 @@ async def generate_summary(request: Request) -> Dict[str, Any]:
         else:
             content_text = raw.decode("utf-8", errors="ignore")
 
-    summary = _simple_summary(content_text or "")
+    # If we still have no text, the PDF is likely scanned/image-based.
+    if not (content_text or "").strip():
+        summary = (
+            "No text content was provided or could be extracted from the uploaded file. "
+            "If you uploaded a PDF, it may be a scanned/image-based document (images). "
+            "This backend can extract selectable text, but it cannot read images unless OCR is enabled. "
+            "Try uploading a text-based PDF or paste text into the box."
+        )
+    else:
+        summary = _simple_summary(content_text or "")
 
     emailed = False
     if recipient_email and email_summary:

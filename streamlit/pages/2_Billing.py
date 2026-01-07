@@ -125,33 +125,36 @@ st.set_page_config(page_title="Billing & Subscription", layout="wide")
 
 st.title("Billing & Subscription")
 
+# ------------------------------------------------------------
+# Post-checkout UX
+# Stripe returns users here with ?status=success|cancel
+# Give a clear next step to proceed to Upload Data.
+# ------------------------------------------------------------
+try:
+    _qp = dict(st.query_params)  # Streamlit >= 1.30
+except Exception:
+    _qp = st.experimental_get_query_params()
+
+_status = (_qp.get("status", [""])[0] if isinstance(_qp.get("status"), list) else _qp.get("status", ""))
+
+if _status == "success":
+    st.success("Checkout complete. Next step: upload your document to generate your summary.")
+    # Streamlit's built-in page switcher (falls back to link if unavailable)
+    col_a, col_b = st.columns([1, 3])
+    with col_a:
+        try:
+            if st.button("Go to Upload Data", type="primary"):
+                st.switch_page("pages/1_Upload_Data.py")
+        except Exception:
+            st.markdown("➡️ **Next:** Use the left menu and click **Upload Data**.")
+    st.divider()
+elif _status == "cancel":
+    st.warning("Checkout was canceled. You can select a plan again below.")
+    st.divider()
+
 # Preserve email across pages
 if "billing_email" not in st.session_state:
     st.session_state["billing_email"] = ""
-
-qp = _get_query_params()
-status = (qp.get("status", [""])[0] if isinstance(qp.get("status"), list) else qp.get("status", ""))
-
-# ---- Stripe return handling ----
-if status == "success":
-    st.success("✅ Checkout complete. You can now upload a document and generate a summary.")
-    cols = st.columns([1, 3])
-    with cols[0]:
-        if st.button("Continue to Upload Data", type="primary"):
-            try:
-                st.switch_page("pages/1_Upload_Data.py")
-            except Exception:
-                st.info("Use the left sidebar and click **Upload Data**.")
-    with cols[1]:
-        st.info("If the button doesn't work, use the left sidebar → **Upload Data**.")
-    # Clear params so refresh doesn't keep showing success
-    _clear_query_params()
-    st.divider()
-
-elif status == "cancel":
-    st.warning("Checkout was canceled. You can select a plan again anytime.")
-    _clear_query_params()
-    st.divider()
 
 # ---- Step 1: Email + plan status ----
 st.subheader("Step 1 — Enter your email")
