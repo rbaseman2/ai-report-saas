@@ -16,6 +16,7 @@ params = st.query_params
 
 checkout_success = (
     params.get("checkout") == "success"
+    or params.get("status") == "success"
     or "session_id" in params
 )
 
