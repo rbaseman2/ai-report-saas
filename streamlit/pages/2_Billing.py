@@ -96,7 +96,8 @@ session_id = first_param(qp, "session_id")
 st.title("Billing & Subscription")
 
 # If Stripe returned success/cancel, show a focused message at the top.
-if status == "success":
+if status and status.startswith("success"):
+
     st.success("✅ Checkout complete! Your subscription is active.")
 
     if session_id:
