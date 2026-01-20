@@ -97,9 +97,18 @@ st.title("Billing & Subscription")
 
 # If Stripe returned success/cancel, show a focused message at the top.
 if status == "success":
-    st.success("✅ Checkout complete!")
+    st.success("✅ Checkout complete! Your subscription is active.")
+
     if session_id:
         st.caption(f"Checkout session: {session_id}")
+
+    st.markdown("### Next step")
+    st.write("Continue to **Upload Data** to generate your first report.")
+
+    if st.button("Go to Upload Data →", type="primary"):
+        st.switch_page("pages/1_🏁_Upload_Data.py")
+
+    st.stop()
 
     # Try to fetch plan/status using the stored email (if present) to show the plan.
     email_for_status = st.session_state.billing_email
