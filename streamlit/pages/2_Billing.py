@@ -106,8 +106,8 @@ if status and status.startswith("success"):
     st.markdown("### Next step")
     st.write("Continue to **Upload Data** to generate your first report.")
 
-    if st.button("Go to Upload Data →", type="primary"):
-        st.switch_page("pages/1_🏁_Upload_Data.py")
+    st.info("➡️ Use the **Upload Data** link in the left sidebar to continue.")
+
 
     st.stop()
 
