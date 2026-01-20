@@ -10,7 +10,7 @@ st.set_page_config(
 )
 
 # ---------------------------------------------------------
-# Detect Stripe Checkout Return
+# Detect Stripe Checkout Return (from / or /Billing)
 # ---------------------------------------------------------
 params = st.query_params
 
@@ -21,25 +21,43 @@ checkout_success = (
 )
 
 # ---------------------------------------------------------
-# Post-Checkout Success UI (Safe / No Billing Changes)
+# Post-Checkout Success UI (SAFE – No Billing Changes)
 # ---------------------------------------------------------
 if checkout_success:
     st.success("✅ Payment successful! You're ready to upload your data.")
 
-    if st.button("Go to Upload Data"):
+    if st.button("Go to Upload Data", type="primary"):
         st.switch_page("pages/1_🏁_Upload_Data.py")
 
-    st.stop()  # Prevent normal page content from rendering
+    st.stop()  # Prevent normal landing page from rendering
 
 # ---------------------------------------------------------
 # Normal Landing Page Content
 # ---------------------------------------------------------
 st.title("📊 AI Business Report Generator")
-st.write("Upload your data, configure branding, and export a polished, client-ready report.")
+st.write(
+    "Upload your data, configure branding, and export a polished, "
+    "client-ready report."
+)
 
-st.page_link("pages/1_🏁_Upload_Data.py", label="Start → Upload Data", icon="🏁")
-st.page_link("pages/2_🧩_Configure_Report.py", label="Step 2 → Configure Report", icon="🧩")
-st.page_link("pages/3_📄_Preview_&_Export.py", label="Step 3 → Preview & Export", icon="📄")
+st.page_link(
+    "pages/1_🏁_Upload_Data.py",
+    label="Start → Upload Data",
+    icon="🏁"
+)
+st.page_link(
+    "pages/2_🧩_Configure_Report.py",
+    label="Step 2 → Configure Report",
+    icon="🧩"
+)
+st.page_link(
+    "pages/3_📄_Preview_&_Export.py",
+    label="Step 3 → Preview & Export",
+    icon="📄"
+)
 
 st.divider()
-st.caption("Tip: Move through the steps from left to right. Your progress is saved in session state.")
+st.caption(
+    "Tip: Move through the steps from left to right. "
+    "Your progress is saved in session state."
+)
