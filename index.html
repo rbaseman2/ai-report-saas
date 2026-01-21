@@ -2,251 +2,90 @@
 <html lang="en">
 <head>
   <meta charset="UTF-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
-  <meta name="google-site-verification" content="fyBHepj7-b06c7RP5QJcTEHGyWeiWjTwXZSEaGHKVP8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Rob AI Solutions</title>
 
-  <!-- SEO Title & Description -->
-  <title>AI Report Generator for Business Documents | Executive Summaries in Minutes</title>
-  <meta name="description"
-        content="Upload PDFs, Word files, or spreadsheets and generate executive-ready business reports with AI. Save hours of manual analysis in minutes." />
-
-  <!-- Canonical -->
-  <link rel="canonical" href="https://robaisolutions.com/" />
-
-  <!-- Favicons -->
-  <link rel="icon" href="images/favicon.png" />
-
-  <!-- Open Graph -->
-  <meta property="og:type" content="website" />
-  <meta property="og:title" content="AI Report Generator for Business Documents" />
-  <meta property="og:description"
-        content="Upload documents and generate executive-ready summaries, insights, and action items using AI." />
-  <meta property="og:url" content="https://robaisolutions.com/" />
-  <meta property="og:image" content="https://robaisolutions.com/images/FullLogo.png" />
-
-  <!-- Twitter -->
-  <meta name="twitter:card" content="summary_large_image" />
-  <meta name="twitter:title" content="AI Report Generator for Business Documents" />
-  <meta name="twitter:description"
-        content="Generate executive-ready business summaries, insights, and action items from documents using AI." />
-  <meta name="twitter:image" content="https://robaisolutions.com/images/FullLogo.png" />
-
-  <!-- Fonts -->
-  <link href="https://fonts.googleapis.com/css2?family=Roboto:wght@400;700&display=swap" rel="stylesheet" />
-
-  <!-- Structured Data: Organization -->
-  <script type="application/ld+json">
-  {
-    "@context": "https://schema.org",
-    "@type": "Organization",
-    "name": "Rob AI Solutions",
-    "url": "https://robaisolutions.com/",
-    "email": "admin@robaisolutions.com",
-    "sameAs": [
-      "https://www.linkedin.com/in/robaisolutions"
-    ]
-  }
+  <!-- Google Analytics (GA4) -->
+  <script async src="https://www.googletagmanager.com/gtag/js?id=G-FE6YRSP3ZM"></script>
+  <script>
+    window.dataLayer = window.dataLayer || [];
+    function gtag(){dataLayer.push(arguments);}
+    gtag('js', new Date());
+    gtag('config', 'G-FE6YRSP3ZM');
   </script>
 
-  <!-- Structured Data: Software Application -->
-  <script type="application/ld+json">
-  {
-    "@context": "https://schema.org",
-    "@type": "SoftwareApplication",
-    "name": "AI Report SaaS",
-    "applicationCategory": "BusinessApplication",
-    "operatingSystem": "Web",
-    "url": "https://ai-report-saas.onrender.com/",
-    "publisher": {
-      "@type": "Organization",
-      "name": "Rob AI Solutions",
-      "url": "https://robaisolutions.com/"
-    },
-    "offers": [
-      { "@type": "Offer", "price": "9.99", "priceCurrency": "USD", "category": "subscription", "name": "Basic" },
-      { "@type": "Offer", "price": "19.99", "priceCurrency": "USD", "category": "subscription", "name": "Pro" },
-      { "@type": "Offer", "price": "39.99", "priceCurrency": "USD", "category": "subscription", "name": "Enterprise" }
-    ]
-  }
-  </script>
-
+  <!-- Existing CSS -->
   <style>
-    :root {
-      --primary-bg: #0a0f1a;
-      --secondary-bg: #0f172a;
-      --text-light: #e5e7eb;
-      --text-muted: #94a3b8;
-      --accent: #38bdf8;
-      --accent-hover: #0ea5e9;
-    }
-
     body {
-      font-family: 'Roboto', sans-serif;
       margin: 0;
-      background: var(--primary-bg);
-      color: var(--text-light);
-      line-height: 1.6;
-    }
-
-    .logo-container {
-      text-align: center;
-      padding: 20px;
-    }
-
-    .logo-container img {
-      height: 180px;
-    }
-
-    nav {
-      background: var(--secondary-bg);
-      text-align: center;
-      padding: 12px 0;
-    }
-
-    nav a {
-      margin: 0 20px;
-      text-decoration: none;
-      color: var(--accent);
-      font-weight: bold;
-    }
-
-    .container {
-      max-width: 960px;
-      margin: 40px auto;
-      padding: 30px;
-      background: #1e293b;
-      border-radius: 12px;
-    }
-
-    h1, h2 {
-      color: var(--accent);
-      text-align: center;
+      font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI",
+        Roboto, Oxygen, Ubuntu, Cantarell, "Open Sans", "Helvetica Neue",
+        sans-serif;
+      background: #020617;
+      color: #e5e7eb;
     }
 
     .hero {
+      max-width: 960px;
+      margin: 0 auto;
+      padding: 80px 20px;
       text-align: center;
-      padding-bottom: 20px;
+    }
+
+    .hero h1 {
+      font-size: clamp(2.2rem, 4vw, 3rem);
+      line-height: 1.15;
+      margin-bottom: 20px;
+      color: #f8fafc;
+    }
+
+    .hero p {
+      font-size: 1.1rem;
+      line-height: 1.6;
+      color: #cbd5f5;
+      margin-bottom: 24px;
     }
 
     .button {
       display: inline-block;
-      padding: 12px 24px;
-      background: var(--accent);
-      color: var(--secondary-bg);
-      font-weight: bold;
-      border-radius: 6px;
+      padding: 14px 26px;
+      font-size: 1rem;
+      font-weight: 600;
+      color: #020617;
+      background: linear-gradient(135deg, #38bdf8, #818cf8);
+      border-radius: 8px;
       text-decoration: none;
-      margin-top: 10px;
+      transition: transform 0.15s ease, box-shadow 0.15s ease;
     }
 
-    ul {
-      color: #cbd5e1;
-      font-size: 1.05rem;
-    }
-
-    footer {
-      text-align: center;
-      padding: 30px;
-      color: var(--text-muted);
-      font-size: 0.9rem;
-    }
-
-    /* =========================
-       Phase A – Step 2 Polish
-       Safe additive CSS only
-       ========================= */
-
-    .hero {
-      padding: 40px 20px;
-    }
-
-    .hero p {
-      max-width: 720px;
-      margin-left: auto;
-      margin-right: auto;
-      font-size: 1.1rem;
-      line-height: 1.6;
-    }
-
-    .hero .button {
-      margin-top: 18px;
-      padding: 14px 28px;
-      font-size: 1.05rem;
-    }
-
-    section ul {
-      max-width: 720px;
-      margin-left: auto;
-      margin-right: auto;
-    }
-
-    section ul li {
-      margin: 10px 0;
+    .button:hover {
+      transform: translateY(-1px);
+      box-shadow: 0 10px 25px rgba(56, 189, 248, 0.25);
     }
   </style>
 </head>
 
 <body>
-  <div class="logo-container">
-    <img src="images/FullLogo.png" alt="Rob AI Solutions logo" />
-  </div>
+  <!-- HERO (UNCHANGED) -->
+  <section class="hero">
+    <h1>Turn Business Documents into Executive-Ready Reports in Minutes</h1>
+    <p>
+      Upload PDFs, Word files, or spreadsheets and instantly generate AI-powered summaries,
+      insights, and action items — no manual analysis required.
+    </p>
 
-  <nav>
-    <a href="index.html">Home</a>
-    <a href="about.html">About</a>
-    <a href="services.html">Services</a>
-    <a href="contact.html">Contact</a>
-  </nav>
+    <a class="button" href="https://ai-report-saas.onrender.com/" target="_blank" rel="noopener">
+      Generate Your First Report
+    </a>
 
-  <main class="container">
+    <p style="margin-top:14px; color:#94a3b8; font-size:0.95rem;">
+      ⭐ Most users choose <strong>Pro</strong> for deeper insights, higher limits,
+      and executive-ready outputs.
+    </p>
 
-    <!-- HERO -->
-    <section class="hero">
-      <h1>Turn Business Documents into Executive-Ready Reports in Minutes</h1>
-      <p>
-        Upload PDFs, Word files, or spreadsheets and instantly generate AI-powered summaries,
-        insights, and action items — no manual analysis required.
-      </p>
-
-      <a class="button" href="https://ai-report-saas.onrender.com/" target="_blank" rel="noopener">
-        Generate Your First Report
-      </a>
-
-      <p style="margin-top:14px; color:#94a3b8; font-size:0.95rem;">
-        ⭐ Most users choose <strong>Pro</strong> for deeper insights, higher limits,
-        and executive-ready outputs.
-      </p>
-
-      <p style="margin-top:10px; font-size:0.9rem; color:#94a3b8;">
-        Secure checkout • Cancel anytime • No setup required
-      </p>
-    </section>
-
-    <!-- WHO IT'S FOR -->
-    <section style="margin-top:50px;">
-      <h2>Built for Professionals Who Work With Documents</h2>
-      <ul>
-        <li>Consultants preparing client reports</li>
-        <li>Business owners reviewing performance data</li>
-        <li>Analysts summarizing large documents</li>
-        <li>Managers creating executive briefings</li>
-      </ul>
-    </section>
-
-    <!-- HOW IT WORKS -->
-    <section style="margin-top:50px;">
-      <h2>How It Works</h2>
-      <ul>
-        <li><strong>Upload your document</strong> — PDF, Word, or spreadsheet</li>
-        <li><strong>AI analyzes the content</strong> — summaries, insights, risks, actions</li>
-        <li><strong>Export a polished report</strong> — ready to share or present</li>
-      </ul>
-    </section>
-
-  </main>
-
-  <footer>
-    <p>&copy; 2026 Rob AI Solutions</p>
-  </footer>
+    <p style="margin-top:10px; font-size:0.9rem; color:#94a3b8;">
+      Secure checkout • Cancel anytime • No setup required
+    </p>
+  </section>
 </body>
 </html>
