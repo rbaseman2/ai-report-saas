@@ -62,3 +62,18 @@ async def calendly_webhook(request: Request):
     response.raise_for_status()
 
     return {"status": "tracked"}
+
+
+@app.get("/calendly/webhook")
+def webhook_test():
+    return {"status": "use POST, not GET"}
+
+
+
+
+
+
+
+
+
+
