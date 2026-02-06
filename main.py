@@ -7,12 +7,15 @@ app = FastAPI()
 GA4_MEASUREMENT_ID = os.getenv("GA4_MEASUREMENT_ID")
 GA4_API_SECRET = os.getenv("GA4_API_SECRET")
 
-if not GA4_MEASUREMENT_ID or not GA4_API_SECRET:
-    raise RuntimeError("GA4_MEASUREMENT_ID or GA4_API_SECRET not set")
 
 @app.post("/calendly/webhook")
 async def calendly_webhook(request: Request):
-    payload = await request.json()
+  if not GA4_MEASUREMENT_ID or not GA4_API_SECRET:
+    print("❌ GA4 env vars missing")
+    return {"status": "ga4_not_configured"}
+ 
+
+ payload = await request.json()
 
     # 🔍 TEMP logging for verification
     print("📩 Calendly webhook received")
