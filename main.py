@@ -10,20 +10,19 @@ GA4_API_SECRET = os.getenv("GA4_API_SECRET")
 
 @app.post("/calendly/webhook")
 async def calendly_webhook(request: Request):
-  if not GA4_MEASUREMENT_ID or not GA4_API_SECRET:
-    print("❌ GA4 env vars missing")
-    return {"status": "ga4_not_configured"}
- 
 
- payload = await request.json()
+    # Check GA4 env vars INSIDE handler
+    if not GA4_MEASUREMENT_ID or not GA4_API_SECRET:
+        print("❌ GA4 env vars missing")
+        return {"status": "ga4_not_configured"}
 
-    # 🔍 TEMP logging for verification
+    payload = await request.json()
+
     print("📩 Calendly webhook received")
     print(payload)
 
     event_type = payload.get("event")
 
-    # Only care about completed bookings
     if event_type != "invitee.created":
         return {"status": "ignored"}
 
@@ -53,7 +52,7 @@ async def calendly_webhook(request: Request):
     }
 
     response = requests.post(
-       "https://www.google-analytics.com/debug/mp/collect",
+        "https://www.google-analytics.com/debug/mp/collect",
         params={
             "measurement_id": GA4_MEASUREMENT_ID,
             "api_secret": GA4_API_SECRET
@@ -62,7 +61,7 @@ async def calendly_webhook(request: Request):
         timeout=5
     )
 
-    response.raise_for_status()
+    print("GA4 response:", response.text)
 
     return {"status": "tracked"}
 
@@ -70,13 +69,3 @@ async def calendly_webhook(request: Request):
 @app.get("/calendly/webhook")
 def webhook_test():
     return {"status": "use POST, not GET"}
-
-
-
-
-
-
-
-
-
-
