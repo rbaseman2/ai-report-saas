@@ -53,8 +53,7 @@ async def calendly_webhook(request: Request):
     }
 
     response = requests.post(
-        "https://www.google-analytics.com/debug/mp/collect",
-
+       "https://www.google-analytics.com/debug/mp/collect",
         params={
             "measurement_id": GA4_MEASUREMENT_ID,
             "api_secret": GA4_API_SECRET
