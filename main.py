@@ -2,11 +2,9 @@ from fastapi import FastAPI, Request, HTTPException
 import requests
 import os
 
-app = FastAPI()
 
 GA4_MEASUREMENT_ID = os.getenv("GA4_MEASUREMENT_ID")
 GA4_API_SECRET = os.getenv("GA4_API_SECRET")
-
 
 @app.post("/calendly/webhook")
 async def calendly_webhook(request: Request):
@@ -14,6 +12,38 @@ async def calendly_webhook(request: Request):
 
     print("📩 Calendly webhook received")
     print(payload)
+
+    if payload.get("event") == "invitee.created":
+
+        if not GA4_MEASUREMENT_ID or not GA4_API_SECRET:
+            print("❌ GA4 env vars missing")
+            return {"status": "ga4_not_configured"}
+
+        invitee = payload["payload"]
+
+        data = {
+            "client_id": invitee.get("email", "unknown"),
+            "events": [{
+                "name": "calendly_booking",
+                "params": {
+                    "event_type": invitee.get("event_type"),
+                    "invitee_email": invitee.get("email")
+                }
+            }]
+        }
+
+        try:
+            requests.post(
+                f"https://www.google-analytics.com/mp/collect"
+                f"?measurement_id={GA4_MEASUREMENT_ID}"
+                f"&api_secret={GA4_API_SECRET}",
+                json=data,
+                timeout=5
+            )
+            print("✅ GA4 event sent")
+
+        except Exception as e:
+            print("⚠ GA4 send failed:", e)
 
     return {"status": "ok"}
 
