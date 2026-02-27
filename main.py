@@ -10,6 +10,12 @@ GA4_API_SECRET = os.getenv("GA4_API_SECRET")
 
 @app.post("/calendly/webhook")
 async def calendly_webhook(request: Request):
+    payload = await request.json()
+
+    print("📩 Calendly webhook received")
+    print(payload)
+
+    return {"status": "ok"}
 
     # Check GA4 env vars INSIDE handler
     if not GA4_MEASUREMENT_ID or not GA4_API_SECRET:
