@@ -2,6 +2,7 @@ from fastapi import FastAPI, Request, HTTPException
 import requests
 import os
 
+app = FastAPI()
 
 GA4_MEASUREMENT_ID = os.getenv("GA4_MEASUREMENT_ID")
 GA4_API_SECRET = os.getenv("GA4_API_SECRET")
