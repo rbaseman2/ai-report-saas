@@ -7,48 +7,10 @@ app = FastAPI()
 GA4_MEASUREMENT_ID = os.getenv("GA4_MEASUREMENT_ID")
 GA4_API_SECRET = os.getenv("GA4_API_SECRET")
 
+
 @app.post("/calendly/webhook")
 async def calendly_webhook(request: Request):
-    payload = await request.json()
 
-    print("📩 Calendly webhook received")
-    print(payload)
-
-    if payload.get("event") == "invitee.created":
-
-        if not GA4_MEASUREMENT_ID or not GA4_API_SECRET:
-            print("❌ GA4 env vars missing")
-            return {"status": "ga4_not_configured"}
-
-        invitee = payload["payload"]
-
-        data = {
-            "client_id": "555.1234567890",
-            "events": [{
-                "name": "calendly_booking",
-                "params": {
-                    "event_type": invitee.get("event_type"),
-                    "invitee_email": invitee.get("email")
-                }
-            }]
-        }
-
-        try:
-            requests.post(
-                f"https://www.google-analytics.com/mp/collect"
-                f"?measurement_id={GA4_MEASUREMENT_ID}"
-                f"&api_secret={GA4_API_SECRET}",
-                json=data,
-                timeout=5
-            )
-            print("✅ GA4 event sent")
-
-        except Exception as e:
-            print("⚠ GA4 send failed:", e)
-
-    return {"status": "ok"}
-
-    # Check GA4 env vars INSIDE handler
     if not GA4_MEASUREMENT_ID or not GA4_API_SECRET:
         print("❌ GA4 env vars missing")
         return {"status": "ga4_not_configured"}
@@ -58,22 +20,19 @@ async def calendly_webhook(request: Request):
     print("📩 Calendly webhook received")
     print(payload)
 
-    event_type = payload.get("event")
-
-    if event_type != "invitee.created":
+    # Only process invitee.created
+    if payload.get("event") != "invitee.created":
         return {"status": "ignored"}
 
     try:
-        invitee = payload["payload"]["invitee"]
-        event = payload["payload"]["event"]
+        invitee = payload["payload"]
+        event = payload["payload"]["scheduled_event"]
     except KeyError:
         raise HTTPException(status_code=400, detail="Malformed Calendly payload")
 
-    user_id = invitee.get("email")
-
     ga4_payload = {
         "client_id": f"calendly_{invitee.get('uuid')}",
-        "user_id": user_id,
+        "user_id": invitee.get("email"),
         "events": [
             {
                 "name": "calendly_booking_completed",
