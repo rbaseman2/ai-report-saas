@@ -23,7 +23,7 @@ async def calendly_webhook(request: Request):
         invitee = payload["payload"]
 
         data = {
-            "client_id": invitee.get("email", "unknown"),
+            "client_id": "555.1234567890",,
             "events": [{
                 "name": "calendly_booking",
                 "params": {
